@@ -23,14 +23,15 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from flax.nnx.nn.attention import dot_product_attention, apply_rotary_emb
-from nanochat.gpt import GPT
 from typing import Optional, Tuple
 import math
 
 
 def norm(x):
-    # Purely functional rmsnorm with no learnable params
-    return jax.nn.standardize(x, axis=-1, epsilon=0) * jnp.sqrt(x.shape[-1])
+    # Purely functional rmsnorm with no learnable params (matches nanochat gpt.py:36-38)
+    # RMSNorm: x / sqrt(mean(x^2) + eps)
+    rms = jnp.sqrt(jnp.mean(x ** 2, axis=-1, keepdims=True) + 1e-6)
+    return x / rms
 
 
 # TODO: bump base theta more, e.g. 100K is more common more recently
@@ -136,6 +137,7 @@ class TransformerBlock(nnx.Module):
         cos_sin: Optional[Tuple[jnp.ndarray, jnp.ndarray]] = None,
         context: Optional[jnp.ndarray] = None,
         mask: Optional[jnp.ndarray] = None,
+        decode: bool = False,
     ) -> jnp.ndarray:
         """
         Forward pass with pre-norm architecture.
@@ -150,11 +152,11 @@ class TransformerBlock(nnx.Module):
             Output tensor with same shape as x
         """
         # Self-attention with pre-norm (matches nanochat line 218)
-        x = x + self.attn(norm(x), mask=mask, cos_sin=cos_sin)
+        x = x + self.attn(norm(x), mask=mask, cos_sin=cos_sin, decode=decode)
 
         # Cross-attention if this is a decoder layer (matches nanochat lines 220-221)
         if self.cross_attention and context is not None:
-            x = x + self.cross_attn(norm(x), context, context, mask=None, cos_sin=None)
+            x = x + self.cross_attn(norm(x), context, context, mask=None, cos_sin=None, decode=decode)
 
         # MLP with pre-norm (matches nanochat line 223)
         x = x + self.mlp(norm(x))
@@ -178,6 +180,7 @@ class BoolformerTransformer(nnx.Module):
 
     def __init__(
         self,
+        rngs: nnx.Rngs,
         # Truth table config
         truth_table_size: int = 1024,
         num_variables: int = 10,
@@ -191,8 +194,6 @@ class BoolformerTransformer(nnx.Module):
         n_head: int = 8,
         n_encoder_layers: int = 6,
         n_decoder_layers: int = 6,
-
-        rngs: nnx.Rngs,
     ):
         """
         Args:
@@ -222,16 +223,16 @@ class BoolformerTransformer(nnx.Module):
         self.formula_embedding = nnx.Embed(vocab_size, n_embd, rngs=rngs)
 
         # Encoder blocks (self-attention only, no cross-attention)
-        self.encoder_blocks = [
+        self.encoder_blocks = nnx.List([
             TransformerBlock(n_embd, n_head, cross_attention=False, rngs=rngs)
             for _ in range(n_encoder_layers)
-        ]
+        ])
 
         # Decoder blocks (self-attention + cross-attention)
-        self.decoder_blocks = [
+        self.decoder_blocks = nnx.List([
             TransformerBlock(n_embd, n_head, cross_attention=True, rngs=rngs)
             for _ in range(n_decoder_layers)
-        ]
+        ])
 
         # Output heads
         # Policy head: predicts next token WITHOUT bias
@@ -271,8 +272,9 @@ class BoolformerTransformer(nnx.Module):
         x = self.truth_table_proj(truth_table_expanded)  # (batch, 1024, n_embd)
 
         # Pass through encoder blocks (no RoPE for encoder - truth table has no positional order)
+        # Encoder always uses decode=False (processes full sequence in parallel, not autoregressive)
         for block in self.encoder_blocks:
-            x = block(x, cos_sin=None, context=None, mask=None)
+            x = block(x, cos_sin=None, context=None, mask=None, decode=False)
 
         return x
 
@@ -280,6 +282,7 @@ class BoolformerTransformer(nnx.Module):
         self,
         formula_tokens: jnp.ndarray,
         encoder_output: jnp.ndarray,
+        decode: bool = False,
     ) -> Tuple[jnp.ndarray, jnp.ndarray]:
         """
         Decode formula tokens with cross-attention to encoder output.
@@ -307,7 +310,7 @@ class BoolformerTransformer(nnx.Module):
 
         # Pass through decoder blocks with RoPE and cross-attention to encoder output
         for block in self.decoder_blocks:
-            x = block(x, cos_sin=cos_sin, context=encoder_output, mask=causal_mask)
+            x = block(x, cos_sin=cos_sin, context=encoder_output, mask=causal_mask, decode=decode)
 
         # Policy head: predict next token for each position
         policy_logits = self.policy_head(x)  # (batch, seq_len, vocab_size)
@@ -326,6 +329,7 @@ class BoolformerTransformer(nnx.Module):
         self,
         truth_table: jnp.ndarray,
         formula_tokens: jnp.ndarray,
+        decode: bool = False,
     ) -> Tuple[jnp.ndarray, jnp.ndarray]:
         """
         Full forward pass: encode truth table, decode formula.
@@ -333,6 +337,7 @@ class BoolformerTransformer(nnx.Module):
         Args:
             truth_table: Binary truth table (batch, 1024)
             formula_tokens: Formula token indices (batch, seq_len)
+            decode: Whether to use KV-caching (True for MCTS generation, False for training)
         Returns:
             (policy_logits, value):
                 - policy_logits: (batch, seq_len, vocab_size)
@@ -343,7 +348,7 @@ class BoolformerTransformer(nnx.Module):
         - value can be used directly as value for mctx.RootFnOutput
         """
         encoder_output = self.encode_truth_table(truth_table)
-        policy_logits, value = self.decode_formula(formula_tokens, encoder_output)
+        policy_logits, value = self.decode_formula(formula_tokens, encoder_output, decode=decode)
         return policy_logits, value
 
 
