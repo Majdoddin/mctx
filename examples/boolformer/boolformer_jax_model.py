@@ -186,7 +186,7 @@ class BoolformerTransformer(nnx.Module):
         num_variables: int = 10,
 
         # Formula config
-        vocab_size: int = 20,
+        vocab_size: int = 15,  # <SOS> + <PAD> + ~ + & + | + x1-x10
         max_formula_length: int = 50,
 
         # Model config
@@ -199,7 +199,7 @@ class BoolformerTransformer(nnx.Module):
         Args:
             truth_table_size: Size of truth table (2^num_variables = 1024)
             num_variables: Number of boolean variables (10)
-            vocab_size: Size of formula token vocabulary (20 tokens)
+            vocab_size: Size of formula token vocabulary (15 tokens: <SOS> + <PAD> + ~ + & + | + x1-x10)
             max_formula_length: Maximum formula sequence length (50)
             n_embd: Embedding dimension (512)
             n_head: Number of attention heads (8)
@@ -249,29 +249,23 @@ class BoolformerTransformer(nnx.Module):
         max_seq_len = max(truth_table_size, max_formula_length)
         self.cos, self.sin = _precompute_rotary_embeddings(max_seq_len, head_dim)
 
-    def encode_truth_table(self, truth_table: jnp.ndarray) -> jnp.ndarray:
+    def encode_points(self, points: jnp.ndarray) -> jnp.ndarray:
         """
-        Encode truth table through encoder.
+        Encode minority class points through encoder.
 
         Args:
-            truth_table: Binary truth table (batch, 1024)
+            points: Variable combinations where output is 1 (batch, num_points, 10)
+                    where num_points <= 512
         Returns:
-            Encoder output (batch, 1024, n_embd)
+            Encoder output (batch, num_points, n_embd)
         """
-        B = truth_table.shape[0]
-
-        # Reshape truth table to (batch, 1024, 10)
-        # Each of 1024 rows represents one combination of 10 boolean variables
-        # TODO: Currently just repeats each bit 10 times - needs proper unpacking
-        # Each row should be: [v0, v1, v2, ..., v9] for that row's variable assignment
-        truth_table_expanded = jnp.repeat(
-            truth_table[:, :, None], self.num_variables, axis=2
-        )  # (batch, 1024, 10)
+        # Points are already in the correct format: (batch, num_points, 10)
+        # Each row is [v0, v1, v2, ..., v9] for that variable combination
 
         # Project to embedding space
-        x = self.truth_table_proj(truth_table_expanded)  # (batch, 1024, n_embd)
+        x = self.truth_table_proj(points)  # (batch, num_points, n_embd)
 
-        # Pass through encoder blocks (no RoPE for encoder - truth table has no positional order)
+        # Pass through encoder blocks (no RoPE for encoder - points have no positional order)
         # Encoder always uses decode=False (processes full sequence in parallel, not autoregressive)
         for block in self.encoder_blocks:
             x = block(x, cos_sin=None, context=None, mask=None, decode=False)
@@ -327,15 +321,16 @@ class BoolformerTransformer(nnx.Module):
 
     def __call__(
         self,
-        truth_table: jnp.ndarray,
+        points: jnp.ndarray,
         formula_tokens: jnp.ndarray,
         decode: bool = False,
     ) -> Tuple[jnp.ndarray, jnp.ndarray]:
         """
-        Full forward pass: encode truth table, decode formula.
+        Full forward pass: encode minority points, decode formula.
 
         Args:
-            truth_table: Binary truth table (batch, 1024)
+            points: Variable combinations where output is 1 (batch, num_points, 10)
+                    where num_points <= 512
             formula_tokens: Formula token indices (batch, seq_len)
             decode: Whether to use KV-caching (True for MCTS generation, False for training)
         Returns:
@@ -347,7 +342,7 @@ class BoolformerTransformer(nnx.Module):
         - policy_logits[:, -1, :] can be used as prior_logits for mctx.RootFnOutput
         - value can be used directly as value for mctx.RootFnOutput
         """
-        encoder_output = self.encode_truth_table(truth_table)
+        encoder_output = self.encode_points(points)
         policy_logits, value = self.decode_formula(formula_tokens, encoder_output, decode=decode)
         return policy_logits, value
 
