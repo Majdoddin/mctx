@@ -28,7 +28,7 @@ from generate_data import generate_formulas
 # Training configuration
 num_variables = 10
 vocab_size = 15
-max_formula_length = 4
+max_formula_length = 4 + 1 #+1 for SOS
 
 # Model architecture
 n_embd = 128
@@ -38,9 +38,10 @@ n_decoder_layers = 2
 
 # Training
 seed = 0
-max_num_iters = 3
+max_num_iters = 2
 selfplay_batch_size = 4  # Formulas per iteration
 num_simulations = 5  # MCTS simulations per action
+max_train_formula_length = 5  # Filter out formulas longer than this (None = no filter)
 temperature = 1.0  # Action sampling temperature
 learning_rate = 0.001
 training_batch_size = 512  # Minibatch size for training
@@ -51,13 +52,11 @@ checkpoint_interval = 1
 
 class SelfplayData(NamedTuple):
     """Data collected during selfplay."""
-    encoder_outputs: jax.Array  # (batch, max_steps, 1024, n_embd) - cached encoder output
+    encoder_outputs: jax.Array  # (batch, max_steps, 512, n_embd) - cached encoder output
     formula_tokens: jax.Array  # (batch, max_steps, max_len) - formula at each step
     positions: jax.Array  # (batch, max_steps) - position at each step
     action_weights: jax.Array  # (batch, max_steps, vocab_size) - MCTS visit counts
     rewards: jax.Array  # (batch, max_steps) - reward at each step
-    terminated: jax.Array  # (batch, max_steps) - termination flag
-    step_count: jax.Array  # (batch,) - actual number of steps per episode
 
 
 def selfplay_single_episode(
@@ -146,6 +145,8 @@ def selfplay_single_episode(
 def selfplay_episode(
     model: BoolformerTransformer,
     env: BoolformerEnv,
+    root_fn,
+    recurrent_fn,
     rng_key: jax.Array
 ) -> SelfplayData:
     """
@@ -155,13 +156,10 @@ def selfplay_episode(
     """
     batch_size = selfplay_batch_size
 
-    # Create root and recurrent functions (shared across episodes)
-    root_fn = create_root_fn(model, env)
-    recurrent_fn = create_recurrent_fn(model, env)
-
     # Generate minority points using Boolformer formula generator
     # TODO: Convert to JAX for JIT compilation (currently uses Python/NumPy)
-    points_array, polish_exprs = generate_formulas(batch_size)
+    max_gen_length = max_train_formula_length if max_train_formula_length is not None else 50  # TODO: Make default configurable
+    points_array, polish_exprs = generate_formulas(batch_size, max_formula_length=max_gen_length)
     points = jnp.array(points_array)  # (batch_size, 512, 10)
 
     # Batch encode all points at once: (batch_size, 512, 10) -> (batch_size, 512, n_embd)
@@ -184,8 +182,6 @@ def selfplay_episode(
         positions=batch_data[2],  # (batch, max_steps)
         action_weights=batch_data[3],  # (batch, max_steps, vocab_size)
         rewards=batch_data[4],  # (batch, max_steps)
-        terminated=jnp.zeros((batch_size, max_formula_length), dtype=jnp.bool_),  # Placeholder
-        step_count=jnp.zeros(batch_size, dtype=jnp.int32),  # Placeholder
     )
 
 
@@ -217,11 +213,11 @@ def compute_training_samples(data: SelfplayData) -> TrainingSample:
 
     # Create mask for valid steps
     # We assume reward != 0 indicates termination
-    # cumsum of (reward != 0) tells us when episode ended
     terminated = data.rewards != 0.0
     terminated_cumsum = jnp.cumsum(terminated, axis=1)
-    # Valid steps: before termination (cumsum == 0) or at termination (cumsum == 1)
-    valid_mask = terminated_cumsum <= 1
+    # Valid steps: before termination (cumsum == 0) or at termination (terminated == True)
+    # After termination, cumsum stays at 1 but terminated is False, so we mask those out
+    valid_mask = (terminated_cumsum == 0) | terminated
 
     # Flatten batch and steps dimensions
     # Shape: (batch * max_steps, ...)
@@ -375,6 +371,10 @@ Config:
     )
     env = BoolformerEnv(model, env_config)
 
+    # Create MCTS functions once (reused across all iterations)
+    root_fn = create_root_fn(model, env)
+    recurrent_fn = create_recurrent_fn(model, env)
+
     # Prepare checkpoint directory
     now = datetime.datetime.now()
     now_str = now.strftime("%Y%m%d_%H%M%S")
@@ -392,7 +392,7 @@ Config:
         # Selfplay
         print(f"[Iter {iteration:04d}] Running selfplay...")
         rng_key, subkey = jax.random.split(rng_key)
-        selfplay_data = selfplay_episode(model, env, subkey)
+        selfplay_data = selfplay_episode(model, env, root_fn, recurrent_fn, subkey)
 
         # Compute training samples
         samples = compute_training_samples(selfplay_data)

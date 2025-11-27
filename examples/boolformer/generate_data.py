@@ -21,9 +21,14 @@ def token_to_id(token):
     else: return 4 + int(token[1:])  # x1->5, x2->6, ..., x10->14
 
 
-def generate_formulas(n=100, max_points=512):
+def generate_formulas(n=100, max_points=512, max_formula_length=50):
     """
     Generate n formulas following Boolformer approach.
+
+    Args:
+        n: Number of formulas to generate
+        max_points: Maximum number of minority points per formula
+        max_formula_length: Maximum length of generated formulas (in tokens)
 
     Returns (points_array, polish_exprs) where:
     - points_array: shape (n, 512, 10) - variable combinations where output is 1 (minority class)
@@ -61,7 +66,7 @@ def generate_formulas(n=100, max_points=512):
                 polish_expr = formula.polish_expr
 
             # Skip if formula is too long
-            if len(polish_expr) > 50:
+            if len(polish_expr) > max_formula_length:
                 continue
 
             # Extract points where output is 1 (the minority class)
