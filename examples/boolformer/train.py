@@ -270,9 +270,13 @@ def loss_single_sample(
     # Value loss: L2 loss with final reward
     value_loss = optax.l2_loss(value_pred, value_target)
 
-    # Apply mask
-    policy_loss = policy_loss * mask
-    value_loss = value_loss * mask
+    # Scale gradients for failures (value_target = -1.0) by 0.1
+    # Successes (value_target = 1.0) get full gradient
+    failure_scale = jnp.where(value_target == -1.0, 0.1, 1.0)
+
+    # Apply mask and failure scaling
+    policy_loss = policy_loss * mask * failure_scale
+    value_loss = value_loss * mask * failure_scale
 
     return policy_loss, value_loss
 
