@@ -394,9 +394,15 @@ Config:
         rng_key, subkey = jax.random.split(rng_key)
         selfplay_data = selfplay_episode(model, env, root_fn, recurrent_fn, subkey)
 
+        # Track episode success (check if episode has +1 or -1 anywhere)
+        num_success = jnp.sum(jnp.any(selfplay_data.rewards == 1.0, axis=1)).item()
+        num_fail = jnp.sum(jnp.any(selfplay_data.rewards == -1.0, axis=1)).item()
+        success_rate = num_success / selfplay_batch_size
+
         # Compute training samples
         samples = compute_training_samples(selfplay_data)
         num_valid = jnp.sum(samples.mask).item()
+        print(f"  Episodes: {num_success}/{selfplay_batch_size} success ({success_rate:.1%}), {num_fail} fail")
         print(f"  Generated {num_valid} training samples")
 
         # Training
