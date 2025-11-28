@@ -26,22 +26,27 @@ from generate_data import generate_formulas
 
 
 # Training configuration
-num_variables = 10
-vocab_size = 15
+num_variables = 3
+vocab_size = 5 + num_variables
 max_formula_length = 4 + 1 #+1 for SOS
 
 # Model architecture (matches Boolformer config/transformer/noiseless.py: 59M params)
-n_embd = 512  # D_MODEL (feedforward dim = 4 * n_embd = 2048 automatically)
-n_head = 16  # NUM_HEADS
-n_encoder_layers = 8  # NUM_ENCODER_LAYERS
-n_decoder_layers = 8  # NUM_DECODER_LAYERS
-# CPU/test config: n_embd=128, n_head=8, n_encoder_layers=2, n_decoder_layers=2
+# n_embd = 512  # D_MODEL (feedforward dim = 4 * n_embd = 2048 automatically)
+# n_head = 16  # NUM_HEADS
+# n_encoder_layers = 8  # NUM_ENCODER_LAYERS
+# n_decoder_layers = 8  # NUM_DECODER_LAYERS
+# CPU/test config:
+
+n_embd=128
+n_head=8
+n_encoder_layers=2
+n_decoder_layers=2
 
 # Training
 seed = 0
 max_num_iters = 2
 selfplay_batch_size = 4  # Formulas per iteration
-num_simulations = 5  # MCTS simulations per action
+num_simulations = 2#5  # MCTS simulations per action
 max_train_formula_length = 5  # Filter out formulas longer than this (None = no filter)
 # temperature = 1.0  # Not used (gumbel_muzero_policy uses Gumbel sampling, not temperature)
 learning_rate = 0.0002  # Matches Boolformer LEARNING_RATE
@@ -53,7 +58,7 @@ checkpoint_interval = 1
 
 class SelfplayData(NamedTuple):
     """Data collected during selfplay."""
-    encoder_outputs: jax.Array  # (batch, max_steps, 512, n_embd) - cached encoder output
+    encoder_outputs: jax.Array  # (batch, max_steps, max_points, n_embd) - cached encoder output
     formula_tokens: jax.Array  # (batch, max_steps, max_len) - formula at each step
     positions: jax.Array  # (batch, max_steps) - position at each step
     action_weights: jax.Array  # (batch, max_steps, vocab_size) - MCTS visit counts
@@ -122,12 +127,12 @@ def selfplay_single_episode(
 
         # Store data
         # TODO: Optimize memory - encoder_output is duplicated across all steps
-        #       Currently: (max_steps, 512, n_embd) per episode
-        #       Could store once: (512, n_embd) per episode
+        #       Currently: (max_steps, max_points, n_embd) per episode
+        #       Could store once: (max_points, n_embd) per episode
         step_data = (
-            state.encoder_output,  # (512, n_embd)
-            state.formula_tokens,  # (max_len,)
-            state.position,  # scalar
+            next_state.encoder_output,  # (max_points, n_embd)
+            next_state.formula_tokens,  # (max_len,) - AFTER action
+            next_state.position,  # scalar - AFTER action
             action_weights,  # (vocab_size,)
             reward,  # scalar
         )
@@ -173,12 +178,12 @@ def selfplay_episode(
     single_episode_fn = partial(selfplay_single_episode, model, env, root_fn, recurrent_fn)
 
     # vmap over (points, encoder_outputs, rng_key)
-    # Episode i gets: points[i] (512, 10), encoder_outputs[i] (512, n_embd), episode_keys[i]
+    # Episode i gets: points[i] (max_points, num_variables), encoder_outputs[i] (max_points, n_embd), episode_keys[i]
     batch_data = jax.vmap(single_episode_fn)(points, encoder_outputs, episode_keys)
 
     # batch_data is tuple of arrays with shape (batch, max_steps, ...)
     return SelfplayData(
-        encoder_outputs=batch_data[0],  # (batch, max_steps, 512, n_embd)
+        encoder_outputs=batch_data[0],  # (batch, max_steps, max_points, n_embd)
         formula_tokens=batch_data[1],  # (batch, max_steps, max_len)
         positions=batch_data[2],  # (batch, max_steps)
         action_weights=batch_data[3],  # (batch, max_steps, vocab_size)
@@ -398,25 +403,25 @@ Config:
         rng_key, subkey = jax.random.split(rng_key)
         selfplay_data = selfplay_episode(model, env, root_fn, recurrent_fn, subkey)
 
-        # Track episode success (check if episode has +1 or -1 anywhere)
-        num_success = jnp.sum(jnp.any(selfplay_data.rewards == 1.0, axis=1)).item()
-        num_fail = jnp.sum(jnp.any(selfplay_data.rewards == -1.0, axis=1)).item()
-        success_rate = num_success / selfplay_batch_size
+        # # Track episode success (check if episode has +1 or -1 anywhere)
+        # num_success = jnp.sum(jnp.any(selfplay_data.rewards == 1.0, axis=1)).item()
+        # num_fail = jnp.sum(jnp.any(selfplay_data.rewards == -1.0, axis=1)).item()
+        # success_rate = num_success / selfplay_batch_size
 
-        # Compute training samples
-        samples = compute_training_samples(selfplay_data)
-        num_valid = jnp.sum(samples.mask).item()
-        print(f"  Episodes: {num_success}/{selfplay_batch_size} success ({success_rate:.1%}), {num_fail} fail")
-        print(f"  Generated {num_valid} training samples")
+        # # Compute training samples
+        # samples = compute_training_samples(selfplay_data)
+        # num_valid = jnp.sum(samples.mask).item()
+        # print(f"  Episodes: {num_success}/{selfplay_batch_size} success ({success_rate:.1%}), {num_fail} fail")
+        # print(f"  Generated {num_valid} training samples")
 
-        # Training
-        print(f"  Training...")
-        loss, policy_loss, value_loss = train_step(model, optimizer, samples)
+        # # Training
+        # print(f"  Training...")
+        # loss, policy_loss, value_loss = train_step(model, optimizer, samples)
 
         iter_time = time.time() - iter_start
 
-        print(f"  Loss: {loss:.4f} (policy={policy_loss:.4f}, value={value_loss:.4f})")
-        print(f"  Time: {iter_time:.2f}s\n")
+        # print(f"  Loss: {loss:.4f} (policy={policy_loss:.4f}, value={value_loss:.4f})")
+        # print(f"  Time: {iter_time:.2f}s\n")
 
         # Checkpoint
         if iteration % checkpoint_interval == 0:

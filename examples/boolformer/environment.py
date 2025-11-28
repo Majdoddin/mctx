@@ -193,18 +193,19 @@ def evaluate_formula_on_points(
     TODO: For training, return ratio of correct evaluations instead of binary 0/1
           to provide softer gradient signal
     """
-    # Evaluate formula on all 1024 combinations
+    # Evaluate formula on all 2^num_variables combinations
+    num_rows = 2 ** config.num_variables
     def eval_row(row_idx):
         variable_values = jnp.array([(row_idx >> bit) & 1 for bit in range(config.num_variables)], dtype=jnp.bool_)
         return evaluate_polish_formula(tokens, position, variable_values, config)
 
-    all_outputs = jax.vmap(eval_row)(jnp.arange(1024))
+    all_outputs = jax.vmap(eval_row)(jnp.arange(num_rows))
 
     # Check each point: should be in minority class (output=True) iff it's a non-padded point
     def check_point(point):
-        is_padding = jnp.all(point == -1)
-        # Convert point to row index: point values are {0, +1}, map to binary
-        point_binary = (point == 1).astype(jnp.int32)
+        is_padding = jnp.all(point == 0)  # Padding is all zeros, not all -1s
+        # Convert point to row index: point values are {-1, +1}, map to binary {0, 1}
+        point_binary = ((point + 1) / 2).astype(jnp.int32)  # -1 -> 0, +1 -> 1
         row_idx = jnp.sum(point_binary * (2 ** jnp.arange(config.num_variables)))
         # Formula should output True for this minority point
         return jnp.where(is_padding, True, all_outputs[row_idx] == True)
@@ -213,7 +214,7 @@ def evaluate_formula_on_points(
 
     # Count True outputs - should equal number of non-padded points
     num_true_outputs = jnp.sum(all_outputs)
-    num_minority_points = jnp.sum(~jnp.all(points == -1, axis=1))
+    num_minority_points = jnp.sum(~jnp.all(points == 0, axis=1))  # Padding is all zeros
     count_correct = num_true_outputs == num_minority_points
 
     return jnp.logical_and(minority_correct, count_correct)

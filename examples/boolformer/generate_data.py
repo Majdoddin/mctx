@@ -57,8 +57,8 @@ def generate_formulas(n, num_variables, max_formula_length):
             if not formula.is_valid:
                 continue
 
-            # Get all 1024 points (each point is [v0, v1, ..., v9, output])
-            pts = pts_generator(config, nb_candidates=10)
+            # Get all 2^num_variables points (each point is [v0, v1, ..., vN-1, output])
+            pts = pts_generator(config, nb_candidates=num_variables)
             evals = formula.evaluate_pts(pts)
             outputs = evals[:, -1].numpy().astype(np.float32)
 
