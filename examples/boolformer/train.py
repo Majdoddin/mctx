@@ -30,11 +30,12 @@ num_variables = 10
 vocab_size = 15
 max_formula_length = 4 + 1 #+1 for SOS
 
-# Model architecture
-n_embd = 128
-n_head = 8
-n_encoder_layers = 2
-n_decoder_layers = 2
+# Model architecture (matches Boolformer config/transformer/noiseless.py: 59M params)
+n_embd = 512  # D_MODEL (feedforward dim = 4 * n_embd = 2048 automatically)
+n_head = 16  # NUM_HEADS
+n_encoder_layers = 8  # NUM_ENCODER_LAYERS
+n_decoder_layers = 8  # NUM_DECODER_LAYERS
+# CPU/test config: n_embd=128, n_head=8, n_encoder_layers=2, n_decoder_layers=2
 
 # Training
 seed = 0
@@ -42,8 +43,8 @@ max_num_iters = 2
 selfplay_batch_size = 4  # Formulas per iteration
 num_simulations = 5  # MCTS simulations per action
 max_train_formula_length = 5  # Filter out formulas longer than this (None = no filter)
-temperature = 1.0  # Action sampling temperature
-learning_rate = 0.001
+# temperature = 1.0  # Not used (gumbel_muzero_policy uses Gumbel sampling, not temperature)
+learning_rate = 0.0002  # Matches Boolformer LEARNING_RATE
 training_batch_size = 512  # Minibatch size for training
 
 # Checkpointing
@@ -159,10 +160,10 @@ def selfplay_episode(
     # Generate minority points using Boolformer formula generator
     # TODO: Convert to JAX for JIT compilation (currently uses Python/NumPy)
     max_gen_length = max_train_formula_length if max_train_formula_length is not None else 50  # TODO: Make default configurable
-    points_array, polish_exprs = generate_formulas(batch_size, max_formula_length=max_gen_length)
-    points = jnp.array(points_array)  # (batch_size, 512, 10)
+    points_array, polish_exprs = generate_formulas(batch_size, num_variables, max_gen_length)
+    points = jnp.array(points_array)  # (batch_size, max_points, num_variables)
 
-    # Batch encode all points at once: (batch_size, 512, 10) -> (batch_size, 512, n_embd)
+    # Batch encode all points at once: (batch_size, max_points, num_variables) -> (batch_size, max_points, n_embd)
     encoder_outputs = model.encode_points(points)
 
     # Generate keys for each episode
@@ -350,7 +351,6 @@ Config:
     rngs = nnx.Rngs(seed)
     model = BoolformerTransformer(
         rngs=rngs,
-        truth_table_size=1024,
         num_variables=num_variables,
         vocab_size=vocab_size,
         max_formula_length=max_formula_length,

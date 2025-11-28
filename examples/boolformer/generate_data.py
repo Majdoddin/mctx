@@ -21,24 +21,32 @@ def token_to_id(token):
     else: return 4 + int(token[1:])  # x1->5, x2->6, ..., x10->14
 
 
-def generate_formulas(n=100, max_points=512, max_formula_length=50):
+def generate_formulas(n, num_variables, max_formula_length):
     """
     Generate n formulas following Boolformer approach.
 
     Args:
         n: Number of formulas to generate
-        max_points: Maximum number of minority points per formula
+        num_variables: Number of boolean variables (overrides config ACTIVE_VAR and DIMENSION_MAX)
         max_formula_length: Maximum length of generated formulas (in tokens)
 
     Returns (points_array, polish_exprs) where:
-    - points_array: shape (n, 512, 10) - variable combinations where output is 1 (minority class)
+    - points_array: shape (n, max_points, num_variables) where max_points = 2^(num_variables-1)
+                    Variable combinations where output is 1 (minority class)
                     Values are -1.0 (False), +1.0 (True), or 0.0 (padding)
                     Padded to fixed size for JAX batching/JIT
     - polish_exprs: list of polish expression lists for inspection
     """
+    # Compute max_points from num_variables (worst case: half the truth table)
+    max_points = 2 ** (num_variables - 1)
+
     # Use noiseless config (path relative to Boolformer root)
     config_path = str(Path(__file__).parent.parent.parent.parent / "config" / "formula" / "noiseless.py")
     config = ConfigFormula(py_config_path=config_path)
+
+    # Override config to match num_variables
+    config.ACTIVE_VAR = num_variables
+    config.DIMENSION_MAX = num_variables
     points_list = []
     polish_exprs = []
 
@@ -71,12 +79,12 @@ def generate_formulas(n=100, max_points=512, max_formula_length=50):
 
             # Extract points where output is 1 (the minority class)
             minority_mask = (outputs == 1)
-            minority_points = pts[:, :10][minority_mask]  # Take first 10 columns (variable values)
+            minority_points = pts[:, :num_variables][minority_mask]  # Take first num_variables columns
 
-            # Pad to fixed size (512, 10) for JAX batching
+            # Pad to fixed size (max_points, num_variables) for JAX batching
             num_points = len(minority_points)
             if num_points > max_points:
-                # Shouldn't happen (max is 512 for 10 vars), but handle it
+                # Shouldn't happen (max_points = 2^(num_variables-1)), but handle it
                 minority_points = minority_points[:max_points]
                 num_points = max_points
 
@@ -84,7 +92,7 @@ def generate_formulas(n=100, max_points=512, max_formula_length=50):
             minority_points = 2.0 * minority_points - 1.0  # 0 -> -1, 1 -> +1
 
             # Pad with 0.0 (distinct from -1/+1)
-            padded_points = np.zeros((max_points, 10), dtype=np.float32)
+            padded_points = np.zeros((max_points, num_variables), dtype=np.float32)
             padded_points[:num_points] = minority_points
 
             points_list.append(padded_points)
@@ -97,7 +105,7 @@ def generate_formulas(n=100, max_points=512, max_formula_length=50):
 
 
 if __name__ == '__main__':
-    points_array, polish_exprs = generate_formulas(10)
+    points_array, polish_exprs = generate_formulas(n=10, num_variables=10, max_formula_length=50)
     print(f"Generated {len(points_array)} formulas")
     print(f"Points array shape: {points_array.shape}")
     print(f"Unique values in points: {np.unique(points_array)}")  # Should be [-1, 0, 1]

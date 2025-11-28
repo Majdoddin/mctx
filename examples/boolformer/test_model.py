@@ -23,7 +23,6 @@ def test_model_creation():
     rngs = nnx.Rngs(0)
     model = BoolformerTransformer(
         rngs=rngs,
-        truth_table_size=1024,
         num_variables=10,
         vocab_size=20,
         max_formula_length=50,

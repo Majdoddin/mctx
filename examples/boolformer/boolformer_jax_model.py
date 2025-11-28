@@ -181,23 +181,19 @@ class BoolformerTransformer(nnx.Module):
     def __init__(
         self,
         rngs: nnx.Rngs,
-        # Truth table config
-        truth_table_size: int = 1024,
-        num_variables: int = 10,
-
-        # Formula config
-        vocab_size: int = 15,  # <SOS> + <PAD> + ~ + & + | + x1-x10
-        max_formula_length: int = 50,
+        # Config
+        num_variables: int,
+        vocab_size: int,  # <SOS> + <PAD> + ~ + & + | + x1-xn
+        max_formula_length: int,
 
         # Model config
-        n_embd: int = 512,
-        n_head: int = 8,
-        n_encoder_layers: int = 6,
-        n_decoder_layers: int = 6,
+        n_embd: int,
+        n_head: int,
+        n_encoder_layers: int,
+        n_decoder_layers: int,
     ):
         """
         Args:
-            truth_table_size: Size of truth table (2^num_variables = 1024)
             num_variables: Number of boolean variables (10)
             vocab_size: Size of formula token vocabulary (15 tokens: <SOS> + <PAD> + ~ + & + | + x1-x10)
             max_formula_length: Maximum formula sequence length (50)
@@ -207,7 +203,6 @@ class BoolformerTransformer(nnx.Module):
             n_decoder_layers: Number of decoder blocks (6)
             rngs: RNG state for initialization
         """
-        self.truth_table_size = truth_table_size
         self.num_variables = num_variables
         self.vocab_size = vocab_size
         self.max_formula_length = max_formula_length
@@ -244,10 +239,10 @@ class BoolformerTransformer(nnx.Module):
         self.value_fc1 = nnx.Linear(n_embd, n_embd, use_bias=False, rngs=rngs)
         self.value_fc2 = nnx.Linear(n_embd, 1, use_bias=False, rngs=rngs)
 
-        # Precompute RoPE cos/sin (matches nanochat gpt.py:336-341)
+        # Precompute RoPE cos/sin for decoder sequences (matches nanochat gpt.py:336-341)
+        # Only decoder needs positional encoding (formula tokens), encoder processes unordered point set
         head_dim = n_embd // n_head
-        max_seq_len = max(truth_table_size, max_formula_length)
-        self.cos, self.sin = _precompute_rotary_embeddings(max_seq_len, head_dim)
+        self.cos, self.sin = _precompute_rotary_embeddings(max_formula_length, head_dim)
 
     def encode_points(self, points: jnp.ndarray) -> jnp.ndarray:
         """
