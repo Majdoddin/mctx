@@ -68,6 +68,7 @@ def create_root_fn(model: BoolformerTransformer, env: BoolformerEnv):
         )
 
         # DEBUG: Print action logits before MCTS (mcts_integration.py:66)
+        jax.debug.print("🔍 [root_fn] legal_actions={}", legal_actions)
         jax.debug.print("🔍 [root_fn] raw_logits (before mask)={}", next_token_logits[0])
         jax.debug.print("🔍 [root_fn] masked_logits={}", masked_logits[0])
 
@@ -168,6 +169,7 @@ def create_recurrent_fn(model: BoolformerTransformer, env: BoolformerEnv):
         )
 
         # DEBUG: Print action logits in recurrent_fn (mcts_integration.py:161)
+        jax.debug.print("🔍 [recurrent_fn] legal_actions={}", legal_actions)
         jax.debug.print("🔍 [recurrent_fn] masked_logits={}", masked_logits[0])
 
         # Value keeps batch dimension: (1,)
