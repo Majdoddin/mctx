@@ -255,7 +255,8 @@ def loss_single_sample(
     position: jax.Array,  # scalar
     policy_target: jax.Array,  # (vocab_size,)
     value_target: jax.Array,  # scalar
-    mask: jax.Array  # scalar bool
+    mask: jax.Array,  # scalar bool
+    failure_scale: jax.Array  # scalar - num_failures / num_successes ratio
 ):
     """Compute loss for single sample."""
     # Forward pass: decode formula from cached encoder output
@@ -279,13 +280,13 @@ def loss_single_sample(
     # Value loss: L2 loss with final reward
     value_loss = optax.l2_loss(value_pred, value_target)
 
-    # Scale gradients for failures (value_target = -1.0) by 0.1
-    # Successes (value_target = 1.0) get full gradient
-    failure_scale = jnp.where(value_target == -1.0, 1.0, 1.0)
+    # Scale failures by num_failures/num_successes ratio to balance gradient contribution
+    # Example: 30 failures, 70 successes -> scale failures by 30/70 = 0.43
+    scale = jnp.where(value_target == -1.0, failure_scale, 1.0)
 
-    # Apply mask and failure scaling
-    policy_loss = policy_loss * mask * failure_scale
-    value_loss = value_loss * mask * failure_scale
+    # Apply mask and scaling
+    policy_loss = policy_loss * mask * scale
+    value_loss = value_loss * mask * scale
 
     return policy_loss, value_loss
 
@@ -300,9 +301,22 @@ def loss_fn(
     Returns:
         total_loss, (policy_loss_mean, value_loss_mean)
     """
+    # Compute failure scale: num_failures / num_successes
+    # Count valid samples with success (+1) and failure (-1)
+    num_success = jnp.sum((samples.value_target == 1.0) & samples.mask)
+    num_failure = jnp.sum((samples.value_target == -1.0) & samples.mask)
+
+    # Scale = num_failures / num_successes (add epsilon to avoid division by zero)
+    # Example: 30 failures, 70 successes -> 30/70 = 0.43
+    failure_scale = num_failure / (num_success + 1e-8)
+
+    # DEBUG: Print gradient scaling (train.py:311)
+    jax.debug.print("⚖️  [loss_fn] num_success={}, num_failure={}, failure_scale={}",
+                    num_success, num_failure, failure_scale)
+
     # Vmap over batch
     batch_loss_fn = jax.vmap(
-        lambda e, f, p, pt, vt, m: loss_single_sample(model, e, f, p, pt, vt, m)
+        lambda e, f, p, pt, vt, m: loss_single_sample(model, e, f, p, pt, vt, m, failure_scale)
     )
 
     policy_losses, value_losses = batch_loss_fn(
