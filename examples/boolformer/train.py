@@ -26,28 +26,28 @@ from generate_data import generate_formulas
 
 
 # Training configuration
-num_variables = 3
+num_variables = 2
 vocab_size = 5 + num_variables
 max_formula_length = 4 + 1 #+1 for SOS
 
 # Model architecture (matches Boolformer config/transformer/noiseless.py: 59M params)
-# n_embd = 512  # D_MODEL (feedforward dim = 4 * n_embd = 2048 automatically)
-# n_head = 16  # NUM_HEADS
-# n_encoder_layers = 8  # NUM_ENCODER_LAYERS
-# n_decoder_layers = 8  # NUM_DECODER_LAYERS
-# CPU/test config:
+n_embd = 512  # D_MODEL (feedforward dim = 4 * n_embd = 2048 automatically)
+n_head = 16  # NUM_HEADS
+n_encoder_layers = 8  # NUM_ENCODER_LAYERS
+n_decoder_layers = 8  # NUM_DECODER_LAYERS
 
-n_embd=128
-n_head=8
-n_encoder_layers=2
-n_decoder_layers=2
+# CPU/test config:
+# n_embd=128
+# n_head=8
+# n_encoder_layers=2
+# n_decoder_layers=2
 
 # Training
 seed = 0
-max_num_iters = 2
-selfplay_batch_size = 4  # Formulas per iteration
-num_simulations = 2#5  # MCTS simulations per action
-max_train_formula_length = 5  # Filter out formulas longer than this (None = no filter)
+max_num_iters = 20
+selfplay_batch_size = 128  # Formulas per iteration
+num_simulations = 8  # MCTS simulations per action
+max_train_formula_length = 4  # Filter out formulas longer than this (None = no filter)
 # temperature = 1.0  # Not used (gumbel_muzero_policy uses Gumbel sampling, not temperature)
 learning_rate = 0.0002  # Matches Boolformer LEARNING_RATE
 training_batch_size = 512  # Minibatch size for training
@@ -277,7 +277,7 @@ def loss_single_sample(
 
     # Scale gradients for failures (value_target = -1.0) by 0.1
     # Successes (value_target = 1.0) get full gradient
-    failure_scale = jnp.where(value_target == -1.0, 0.1, 1.0)
+    failure_scale = jnp.where(value_target == -1.0, 1.0, 1.0)
 
     # Apply mask and failure scaling
     policy_loss = policy_loss * mask * failure_scale
@@ -403,25 +403,25 @@ Config:
         rng_key, subkey = jax.random.split(rng_key)
         selfplay_data = selfplay_episode(model, env, root_fn, recurrent_fn, subkey)
 
-        # # Track episode success (check if episode has +1 or -1 anywhere)
-        # num_success = jnp.sum(jnp.any(selfplay_data.rewards == 1.0, axis=1)).item()
-        # num_fail = jnp.sum(jnp.any(selfplay_data.rewards == -1.0, axis=1)).item()
-        # success_rate = num_success / selfplay_batch_size
+        # Track episode success (check if episode has +1 or -1 anywhere)
+        num_success = jnp.sum(jnp.any(selfplay_data.rewards == 1.0, axis=1)).item()
+        num_fail = jnp.sum(jnp.any(selfplay_data.rewards == -1.0, axis=1)).item()
+        success_rate = num_success / selfplay_batch_size
 
-        # # Compute training samples
-        # samples = compute_training_samples(selfplay_data)
-        # num_valid = jnp.sum(samples.mask).item()
-        # print(f"  Episodes: {num_success}/{selfplay_batch_size} success ({success_rate:.1%}), {num_fail} fail")
-        # print(f"  Generated {num_valid} training samples")
+        # Compute training samples
+        samples = compute_training_samples(selfplay_data)
+        num_valid = jnp.sum(samples.mask).item()
+        print(f"  Episodes: {num_success}/{selfplay_batch_size} success ({success_rate:.1%}), {num_fail} fail")
+        print(f"  Generated {num_valid} training samples")
 
-        # # Training
-        # print(f"  Training...")
-        # loss, policy_loss, value_loss = train_step(model, optimizer, samples)
+        # Training
+        print(f"  Training...")
+        loss, policy_loss, value_loss = train_step(model, optimizer, samples)
 
         iter_time = time.time() - iter_start
 
-        # print(f"  Loss: {loss:.4f} (policy={policy_loss:.4f}, value={value_loss:.4f})")
-        # print(f"  Time: {iter_time:.2f}s\n")
+        print(f"  Loss: {loss:.4f} (policy={policy_loss:.4f}, value={value_loss:.4f})")
+        print(f"  Time: {iter_time:.2f}s\n")
 
         # Checkpoint
         if iteration % checkpoint_interval == 0:
