@@ -48,6 +48,9 @@ def create_root_fn(model: BoolformerTransformer, env: BoolformerEnv):
         # Decode only (encoder already ran in env.reset())
         policy_logits, value = model.decode_formula(formula_tokens, encoder_output, decode=False)
 
+        # DEBUG: Print value prediction in root_fn (mcts_integration.py:49)
+        jax.debug.print("🔍 [root_fn] position={}, value={}", state.position, value[0])
+
         # Extract logits for next token (at current position)
         # policy_logits shape: (1, seq_len, vocab_size)
         # We want logits at position `state.position - 1` (0-indexed)
@@ -63,6 +66,10 @@ def create_root_fn(model: BoolformerTransformer, env: BoolformerEnv):
             next_token_logits,
             jnp.full_like(next_token_logits, -1e9)
         )
+
+        # DEBUG: Print action logits before MCTS (mcts_integration.py:66)
+        jax.debug.print("🔍 [root_fn] raw_logits (before mask)={}", next_token_logits[0])
+        jax.debug.print("🔍 [root_fn] masked_logits={}", masked_logits[0])
 
         # Value keeps batch dimension: (1,)
         # mctx expects shape [B] for value
@@ -143,6 +150,10 @@ def create_recurrent_fn(model: BoolformerTransformer, env: BoolformerEnv):
         # Decode only (encoder already cached in state)
         policy_logits, value = model.decode_formula(formula_tokens, encoder_output, decode=False)
 
+        # DEBUG: Print value prediction in recurrent_fn (mcts_integration.py:151)
+        jax.debug.print("🔍 [recurrent_fn] action={}, next_position={}, reward={}, value={}",
+                        single_action, next_state.position, reward, value[0])
+
         # Extract logits for next token
         # Keep batch dimension: (1, vocab_size)
         next_token_logits = policy_logits[:, next_state.position - 1, :]
@@ -155,6 +166,9 @@ def create_recurrent_fn(model: BoolformerTransformer, env: BoolformerEnv):
             next_token_logits,
             jnp.full_like(next_token_logits, -1e9)
         )
+
+        # DEBUG: Print action logits in recurrent_fn (mcts_integration.py:161)
+        jax.debug.print("🔍 [recurrent_fn] masked_logits={}", masked_logits[0])
 
         # Value keeps batch dimension: (1,)
 

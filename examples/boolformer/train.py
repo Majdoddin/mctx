@@ -111,6 +111,10 @@ def selfplay_single_episode(
             # Take action
             action = policy_output.action[0]  # Remove batch dim
             action_weights = policy_output.action_weights[0]  # Remove batch dim
+
+            # DEBUG: Print MCTS output (train.py:112)
+            jax.debug.print("🎯 [MCTS] selected_action={}, action_weights={}", action, action_weights)
+
             next_state, reward, terminated = env.step(state, action)
 
             return next_state, action_weights, reward
