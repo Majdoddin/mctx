@@ -31,22 +31,22 @@ vocab_size = 5 + num_variables
 max_formula_length = 4 + 1 #+1 for SOS
 
 # Model architecture (matches Boolformer config/transformer/noiseless.py: 59M params)
-n_embd = 512  # D_MODEL (feedforward dim = 4 * n_embd = 2048 automatically)
-n_head = 16  # NUM_HEADS
-n_encoder_layers = 8  # NUM_ENCODER_LAYERS
-n_decoder_layers = 8  # NUM_DECODER_LAYERS
+# n_embd = 512  # D_MODEL (feedforward dim = 4 * n_embd = 2048 automatically)
+# n_head = 16  # NUM_HEADS
+# n_encoder_layers = 8  # NUM_ENCODER_LAYERS
+# n_decoder_layers = 8  # NUM_DECODER_LAYERS
 
 # CPU/test config:
-# n_embd=128
-# n_head=8
-# n_encoder_layers=2
-# n_decoder_layers=2
+n_embd=128
+n_head=8
+n_encoder_layers=2
+n_decoder_layers=2
 
 # Training
 seed = 0
 max_num_iters = 20
-selfplay_batch_size = 128  # Formulas per iteration
-num_simulations = 8  # MCTS simulations per action
+selfplay_batch_size = 3#128  # Formulas per iteration
+num_simulations = 3#8  # MCTS simulations per action
 max_train_formula_length = 4  # Filter out formulas longer than this (None = no filter)
 # temperature = 1.0  # Not used (gumbel_muzero_policy uses Gumbel sampling, not temperature)
 learning_rate = 0.0002  # Matches Boolformer LEARNING_RATE
@@ -386,6 +386,10 @@ Config:
         n_encoder_layers=n_encoder_layers,
         n_decoder_layers=n_decoder_layers,
     )
+
+    # Reinitialize weights following nanochat scheme
+    print("Reinitializing weights with nanochat scheme...")
+    model.init_weights()
 
     # Initialize optimizer (use all model parameters)
     optimizer = nnx.Optimizer(model, optax.adam(learning_rate), wrt=nnx.All(nnx.Param))

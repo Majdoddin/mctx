@@ -47,15 +47,14 @@ def create_root_fn(model: BoolformerTransformer, env: BoolformerEnv):
 
         # Decode only (encoder already ran in env.reset())
         policy_logits, value = model.decode_formula(formula_tokens, encoder_output, decode=False)
+        # value shape: (batch, seq_len), policy_logits shape: (batch, seq_len, vocab_size)
 
-        # DEBUG: Print value prediction in root_fn (mcts_integration.py:49)
-        jax.debug.print("🔍 [root_fn] position={}, value={}", state.position, value[0])
+        # Extract value and logits at current position (position is 1-indexed)
+        current_value = value[:, state.position - 1]  # (batch,)
+        next_token_logits = policy_logits[:, state.position - 1, :]  # (batch, vocab_size)
 
-        # Extract logits for next token (at current position)
-        # policy_logits shape: (1, seq_len, vocab_size)
-        # We want logits at position `state.position - 1` (0-indexed)
-        # Keep batch dimension: (1, vocab_size)
-        next_token_logits = policy_logits[:, state.position - 1, :]
+        # DEBUG: Print value prediction in root_fn
+        jax.debug.print("🔍 [root_fn] position={}, value={}", state.position, current_value[0])
 
         # Apply legal action mask
         legal_actions = env.get_legal_actions(state)
@@ -72,11 +71,7 @@ def create_root_fn(model: BoolformerTransformer, env: BoolformerEnv):
         jax.debug.print("🔍 [root_fn] raw_logits (before mask)={}", next_token_logits[0])
         jax.debug.print("🔍 [root_fn] masked_logits={}", masked_logits[0])
 
-        # Value keeps batch dimension: (1,)
-        # mctx expects shape [B] for value
-
         # Add batch dimension to all state fields for mctx embedding
-        # Use a helper to add batch dim to each field
         def add_batch_dim(arr):
             if arr.ndim == 0:  # scalar
                 return arr[None]
@@ -88,8 +83,8 @@ def create_root_fn(model: BoolformerTransformer, env: BoolformerEnv):
         batched_state = jax.tree.map(add_batch_dim, state)
 
         return mctx.RootFnOutput(
-            prior_logits=masked_logits,  # Shape: (1, vocab_size)
-            value=value,  # Shape: (1,)
+            prior_logits=masked_logits,  # Shape: (batch, vocab_size)
+            value=current_value,  # Shape: (batch,) - extracted at current position
             embedding=batched_state  # Pass batched state as embedding
         )
 

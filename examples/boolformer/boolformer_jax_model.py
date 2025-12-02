@@ -304,13 +304,14 @@ class BoolformerTransformer(nnx.Module):
         # Policy head: predict next token for each position
         policy_logits = self.policy_head(x)  # (batch, seq_len, vocab_size)
 
-        # Value head: pool sequence and predict scalar value
-        # Use mean pooling over sequence dimension
-        pooled = jnp.mean(x, axis=1)  # (batch, n_embd)
-        value = self.value_fc1(pooled)
-        value = jax.nn.relu(value)
-        value = self.value_fc2(value)
-        value = jnp.tanh(value).squeeze(-1)  # (batch,) in range [-1, 1]
+        # Value head: predict value for each position using same embedding as policy
+        # TODO: Wasteful during MCTS - should only compute for current position
+        # TODO: Consider relu^2 activation like nanochat instead of GELU
+        # For now, compute for all positions and extract the needed one later
+        value = self.value_fc1(x)  # (batch, seq_len, n_embd) - Linear applies to last dim
+        value = jax.nn.gelu(value)
+        value = self.value_fc2(value)  # (batch, seq_len, 1)
+        value = jnp.tanh(value).squeeze(-1)  # (batch, seq_len) in range [-1, 1]
 
         return policy_logits, value
 
@@ -340,6 +341,72 @@ class BoolformerTransformer(nnx.Module):
         encoder_output = self.encode_points(points)
         policy_logits, value = self.decode_formula(formula_tokens, encoder_output, decode=decode)
         return policy_logits, value
+
+    def init_weights(self):
+        """
+        Initialize weights following nanochat's scheme (gpt.py:157-183).
+
+        Nanochat uses untied weights (line 6: "untied weights for token embedding and lm_head"):
+        1. Input embeddings: std=1.0
+        2. Hidden Linear layers: custom variance scaling std = (1/√fan_in) × min(1.0, √(fan_out/fan_in))
+        3. Output layers: zero init (lm_head, MLP c_proj, attention c_proj)
+
+        Our mapping:
+        - truth_table_proj (Linear, input projection): std=1.0 (like embedding layer)
+        - formula_embedding (Embed, input): std=1.0 (like nanochat wte)
+        - policy_head (Linear, output): zero init (like nanochat lm_head)
+        - value_fc1 (Linear, hidden): custom variance scaling
+        - value_fc2 (Linear, output): zero init (like MLP c_proj)
+        """
+        import jax
+
+        # Generate array of random keys for all layer initializations
+        master_key = jax.random.PRNGKey(0)
+        keys = jax.random.split(master_key, num=1000)
+        i = 0
+
+        def next_key():
+            nonlocal i
+            key = keys[i]
+            i += 1
+            return key
+
+        def apply_custom_init(lin):
+            """Apply nanochat's custom variance scaling (gpt.py:174-179)."""
+            shape = lin.kernel.value.shape
+            # Handle both Linear (2D) and LinearGeneral (3D+)
+            # fan_in = first dimension, fan_out = product of remaining dimensions
+            fan_in = int(shape[0])
+            fan_out = int(jnp.prod(jnp.array(shape[1:])))
+            std = (1.0 / jnp.sqrt(fan_in)) * min(1.0, jnp.sqrt(fan_out / fan_in))
+            lin.kernel.value = jax.random.normal(next_key(), shape) * std
+
+        # Input layers: std=1.0 (like nanochat embeddings)
+        self.truth_table_proj.kernel.value = jax.random.normal(next_key(), self.truth_table_proj.kernel.value.shape) * 1.0
+        self.formula_embedding.embedding.value = jax.random.normal(next_key(), self.formula_embedding.embedding.value.shape) * 1.0
+
+        # Transformer blocks (encoder + decoder)
+        all_blocks = list(self.encoder_blocks) + list(self.decoder_blocks)
+        for block in all_blocks:
+            # MLP layers
+            apply_custom_init(block.mlp.c_fc)     # Hidden layer
+            block.mlp.c_proj.kernel.value = jnp.zeros_like(block.mlp.c_proj.kernel.value)  # Zero init (nanochat gpt.py:163)
+
+            # Attention layers: nnx.MultiHeadAttention has query, key, value, out
+            for attn in [block.attn] + ([block.cross_attn] if block.cross_attention else []):
+                # Query, Key, Value projections: custom variance scaling
+                apply_custom_init(attn.query)
+                apply_custom_init(attn.key)
+                apply_custom_init(attn.value)
+                # Output projection: zero init (nanochat gpt.py:164)
+                attn.out.kernel.value = jnp.zeros_like(attn.out.kernel.value)
+
+        # Value head
+        apply_custom_init(self.value_fc1)        # Hidden layer
+        self.value_fc2.kernel.value = jnp.zeros_like(self.value_fc2.kernel.value)  # Zero init
+
+        # Policy head: zero init (untied from input, like nanochat lm_head)
+        self.policy_head.kernel.value = jnp.zeros_like(self.policy_head.kernel.value)
 
 
 # Example usage for mctx integration:
