@@ -136,7 +136,7 @@ def selfplay_single_episode(
         step_data = (
             next_state.encoder_output,  # (max_points, n_embd)
             next_state.formula_tokens,  # (max_len,) - AFTER action
-            next_state.position,  # scalar - AFTER action
+            state.position,  # scalar - position BEFORE action (where decision was made)
             action_weights,  # (vocab_size,)
             reward,  # scalar
         )
@@ -196,22 +196,22 @@ def selfplay_episode(
 
 
 class TrainingSample(NamedTuple):
-    """Training sample after processing selfplay data."""
-    encoder_output: jax.Array  # (num_points, n_embd)
-    formula_tokens: jax.Array  # (max_len,)
-    position: jax.Array  # scalar
-    policy_target: jax.Array  # (vocab_size,) - action_weights from MCTS
-    value_target: jax.Array  # scalar - final reward
-    mask: jax.Array  # scalar bool - whether this sample is valid
+    """Training samples after processing selfplay data (batch of episodes)."""
+    encoder_output: jax.Array  # (batch, num_points, n_embd)
+    formula_tokens: jax.Array  # (batch, max_len)
+    positions: jax.Array  # (batch, max_steps) - position at each step
+    policy_targets: jax.Array  # (batch, max_steps, vocab_size) - action_weights from MCTS
+    value_targets: jax.Array  # (batch, max_steps) - final reward for each step
+    mask: jax.Array  # (batch, max_steps) bool - valid steps
 
 
 def compute_training_samples(data: SelfplayData) -> TrainingSample:
     """
     Convert selfplay data to training samples.
 
-    For each step in each episode, create a training sample with:
-    - Input: (encoder_output, formula_tokens, position)
-    - Target: (policy=action_weights, value=final_reward)
+    Keeps batch structure (batch, max_steps) for efficient training.
+    - Input: (encoder_output, formula_tokens) per episode
+    - Targets: (policy_targets, value_targets) for all steps
     """
     batch_size, max_steps = data.rewards.shape
 
@@ -229,66 +229,61 @@ def compute_training_samples(data: SelfplayData) -> TrainingSample:
     # After termination, cumsum stays at 1 but terminated is False, so we mask those out
     valid_mask = (terminated_cumsum == 0) | terminated
 
-    # Flatten batch and steps dimensions
-    # Shape: (batch * max_steps, ...)
-    encoder_flat = data.encoder_outputs.reshape(-1, data.encoder_outputs.shape[2], data.encoder_outputs.shape[-1])
-    formula_flat = data.formula_tokens.reshape(-1, data.formula_tokens.shape[-1])
-    positions_flat = data.positions.reshape(-1)
-    policy_flat = data.action_weights.reshape(-1, data.action_weights.shape[-1])
-    value_flat = value_targets.reshape(-1)
-    mask_flat = valid_mask.reshape(-1)
+    # Extract final formula_tokens and encoder_output for each episode (last valid step)
+    last_valid_idx = jnp.sum(valid_mask, axis=1) - 1  # (batch,)
+    final_formula_tokens = data.formula_tokens[jnp.arange(batch_size), last_valid_idx]  # (batch, max_len)
+    final_encoder_outputs = data.encoder_outputs[jnp.arange(batch_size), last_valid_idx]  # (batch, num_points, n_embd)
 
     return TrainingSample(
-        encoder_output=encoder_flat,
-        formula_tokens=formula_flat,
-        position=positions_flat,
-        policy_target=policy_flat,
-        value_target=value_flat,
-        mask=mask_flat,
+        encoder_output=final_encoder_outputs,  # (batch, num_points, n_embd)
+        formula_tokens=final_formula_tokens,  # (batch, max_len)
+        positions=data.positions,  # (batch, max_steps)
+        policy_targets=data.action_weights,  # (batch, max_steps, vocab_size)
+        value_targets=value_targets,  # (batch, max_steps)
+        mask=valid_mask,  # (batch, max_steps)
     )
 
 
-def loss_single_sample(
+def loss_per_episode(
     model: BoolformerTransformer,
     encoder_output: jax.Array,  # (num_points, n_embd)
     formula_tokens: jax.Array,  # (max_len,)
-    position: jax.Array,  # scalar
-    policy_target: jax.Array,  # (vocab_size,)
-    value_target: jax.Array,  # scalar
-    mask: jax.Array,  # scalar bool
-    failure_scale: jax.Array  # scalar - num_failures / num_successes ratio
+    positions: jax.Array,  # (max_steps,) - position at each step
+    policy_targets: jax.Array,  # (max_steps, vocab_size)
+    value_targets: jax.Array,  # (max_steps,)
+    mask: jax.Array,  # (max_steps,) bool
+    failure_scale: jax.Array  # scalar
 ):
-    """Compute loss for single sample."""
-    # Forward pass: decode formula from cached encoder output
-    # Add batch dimension
-    encoder_output_batch = encoder_output[None, :]  # (1, 1024, n_embd)
-    formula_tokens_batch = formula_tokens[None, :]  # (1, max_len)
-
-    policy_logits, value = model.decode_formula(
-        formula_tokens_batch, encoder_output_batch, decode=False
+    """Compute loss for all steps in one episode."""
+    # Forward pass: decode formula once to get all position outputs
+    # vmap automatically handles batching when this is called with jax.vmap
+    policy_logits, values = model.decode_formula(
+        formula_tokens, encoder_output, decode=False
     )
+    # policy_logits: (max_len, vocab_size), values: (max_len)
 
-    # Extract logits at current position
-    # policy_logits shape: (1, max_len, vocab_size)
-    # We want position-1 (0-indexed, position includes SOS)
-    next_token_logits = policy_logits[0, position - 1, :]  # (vocab_size,)
-    value_pred = value[0]  # scalar
+    # Extract predictions at each step's position
+    # positions are 1-indexed, convert to 0-indexed
+    indices = positions - 1  # (max_steps,)
+    policy_preds = policy_logits[indices]  # (max_steps, vocab_size)
+    value_preds = values[indices]  # (max_steps,)
 
     # Policy loss: cross-entropy with MCTS action weights
-    policy_loss = optax.softmax_cross_entropy(next_token_logits, policy_target)
+    policy_losses = jax.vmap(optax.softmax_cross_entropy)(policy_preds, policy_targets)  # (max_steps,)
 
     # Value loss: L2 loss with final reward
-    value_loss = optax.l2_loss(value_pred, value_target)
+    # Broadcast value_targets if it's scalar to match value_preds shape
+    value_targets_broadcast = jnp.broadcast_to(value_targets, value_preds.shape)
+    value_losses = jax.vmap(optax.l2_loss)(value_preds, value_targets_broadcast)  # (max_steps,)
 
-    # Scale failures by num_failures/num_successes ratio to balance gradient contribution
-    # Example: 30 failures, 70 successes -> scale failures by 30/70 = 0.43
-    scale = jnp.where(value_target == -1.0, failure_scale, 1.0)
+    # Scale failures by ratio to balance gradient contribution
+    scales = jnp.where(value_targets_broadcast == -1.0, failure_scale, 1.0)  # (max_steps,)
 
     # Apply mask and scaling
-    policy_loss = policy_loss * mask * scale
-    value_loss = value_loss * mask * scale
+    policy_losses = policy_losses * mask * scales
+    value_losses = value_losses * mask * scales
 
-    return policy_loss, value_loss
+    return policy_losses, value_losses
 
 
 def loss_fn(
@@ -296,39 +291,38 @@ def loss_fn(
     samples: TrainingSample
 ):
     """
-    Compute loss on batch of samples.
+    Compute loss on batch of episodes.
 
     Returns:
         total_loss, (policy_loss_mean, value_loss_mean)
     """
-    # Compute failure scale: num_failures / num_successes
-    # Count valid samples with success (+1) and failure (-1)
-    num_success = jnp.sum((samples.value_target == 1.0) & samples.mask)
-    num_failure = jnp.sum((samples.value_target == -1.0) & samples.mask)
+    # Compute failure scale: num_failures / num_successes across all valid steps
+    num_success = jnp.sum((samples.value_targets == 1.0) & samples.mask)
+    num_failure = jnp.sum((samples.value_targets == -1.0) & samples.mask)
 
     # Scale = num_failures / num_successes (add epsilon to avoid division by zero)
-    # Example: 30 failures, 70 successes -> 30/70 = 0.43
     failure_scale = num_failure / (num_success + 1e-8)
 
-    # DEBUG: Print gradient scaling (train.py:311)
+    # DEBUG: Print gradient scaling
     jax.debug.print("⚖️  [loss_fn] num_success={}, num_failure={}, failure_scale={}",
                     num_success, num_failure, failure_scale)
 
-    # Vmap over batch
+    # Vmap over batch of episodes
     batch_loss_fn = jax.vmap(
-        lambda e, f, p, pt, vt, m: loss_single_sample(model, e, f, p, pt, vt, m, failure_scale)
+        lambda e, f, p, pt, vt, m: loss_per_episode(model, e, f, p, pt, vt, m, failure_scale)
     )
 
     policy_losses, value_losses = batch_loss_fn(
         samples.encoder_output,
         samples.formula_tokens,
-        samples.position,
-        samples.policy_target,
-        samples.value_target,
+        samples.positions,
+        samples.policy_targets,
+        samples.value_targets,
         samples.mask,
     )
+    # policy_losses, value_losses: (batch, max_steps)
 
-    # Mean over valid samples
+    # Mean over all valid steps
     num_valid = jnp.sum(samples.mask) + 1e-8
     policy_loss_mean = jnp.sum(policy_losses) / num_valid
     value_loss_mean = jnp.sum(value_losses) / num_valid

@@ -145,14 +145,15 @@ def create_recurrent_fn(model: BoolformerTransformer, env: BoolformerEnv):
 
         # Decode only (encoder already cached in state)
         policy_logits, value = model.decode_formula(formula_tokens, encoder_output, decode=False)
+        # value shape: (batch, seq_len), policy_logits shape: (batch, seq_len, vocab_size)
 
-        # DEBUG: Print value prediction in recurrent_fn (mcts_integration.py:151)
+        # Extract value and logits at the token we just placed (next_state.position - 1)
+        current_value = value[:, next_state.position - 1]  # (batch,)
+        next_token_logits = policy_logits[:, next_state.position - 1, :]  # (batch, vocab_size)
+
+        # DEBUG: Print value prediction in recurrent_fn
         jax.debug.print("🔍 [recurrent_fn] action={}, next_position={}, reward={}, value={}",
-                        single_action, next_state.position, reward, value[0])
-
-        # Extract logits for next token
-        # Keep batch dimension: (1, vocab_size)
-        next_token_logits = policy_logits[:, next_state.position - 1, :]
+                        single_action, next_state.position, reward, current_value[0])
 
         # Apply legal action mask
         legal_actions = env.get_legal_actions(next_state)
@@ -166,8 +167,6 @@ def create_recurrent_fn(model: BoolformerTransformer, env: BoolformerEnv):
         # DEBUG: Print action logits in recurrent_fn (mcts_integration.py:161)
         jax.debug.print("🔍 [recurrent_fn] legal_actions={}", legal_actions)
         jax.debug.print("🔍 [recurrent_fn] masked_logits={}", masked_logits[0])
-
-        # Value keeps batch dimension: (1,)
 
         # Add batch dimension to next_state for mctx embedding
         def add_batch_dim(arr):
@@ -185,10 +184,10 @@ def create_recurrent_fn(model: BoolformerTransformer, env: BoolformerEnv):
         discount_batched = discount[None]  # scalar -> (1,)
 
         recurrent_output = mctx.RecurrentFnOutput(
-            reward=reward_batched,  # Shape: (1,)
-            discount=discount_batched,  # Shape: (1,)
-            prior_logits=masked_logits,  # Shape: (1, vocab_size)
-            value=value,  # Shape: (1,)
+            reward=reward_batched,  # Shape: (batch,)
+            discount=discount_batched,  # Shape: (batch,)
+            prior_logits=masked_logits,  # Shape: (batch, vocab_size)
+            value=current_value,  # Shape: (batch,) - extracted at current position
         )
 
         # Return (output, next_embedding)
