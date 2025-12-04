@@ -11,16 +11,15 @@ import os
 import pickle
 import time
 from functools import partial
-from typing import NamedTuple
-
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
 import mctx
 import optax
 
 from boolformer_jax_model import BoolformerTransformer
-from environment import BoolformerEnv, BoolformerConfig, BoolformerState
+from environment import BoolformerEnv, BoolformerConfig
 from mcts_integration import create_root_fn, create_recurrent_fn
 from generate_data import generate_formulas
 
@@ -50,19 +49,13 @@ num_simulations = 3#8  # MCTS simulations per action
 max_train_formula_length = 4  # Filter out formulas longer than this (None = no filter)
 # temperature = 1.0  # Not used (gumbel_muzero_policy uses Gumbel sampling, not temperature)
 learning_rate = 0.0002  # Matches Boolformer LEARNING_RATE
-training_batch_size = 512  # Minibatch size for training
+training_batch_size = 16  # Minibatch size for training
+pool_size = 150  # Circular buffer size for sample pool
 
 # Checkpointing
 checkpoint_interval = 1
 
 
-class SelfplayData(NamedTuple):
-    """Data collected during selfplay."""
-    encoder_outputs: jax.Array  # (batch, max_steps, max_points, n_embd) - cached encoder output
-    formula_tokens: jax.Array  # (batch, max_steps, max_len) - formula at each step
-    positions: jax.Array  # (batch, max_steps) - position at each step
-    action_weights: jax.Array  # (batch, max_steps, vocab_size) - MCTS visit counts
-    rewards: jax.Array  # (batch, max_steps) - reward at each step
 
 
 def selfplay_single_episode(
@@ -81,13 +74,6 @@ def selfplay_single_episode(
     """
     state = env.reset(rng_key, points, encoder_output)
     max_steps = max_formula_length
-
-    # Storage for episode data
-    data_encoder = []
-    data_formula = []
-    data_positions = []
-    data_action_weights = []
-    data_rewards = []
 
     def step_fn(carry, step_rng_key):
         """One step of episode."""
@@ -158,11 +144,12 @@ def selfplay_episode(
     root_fn,
     recurrent_fn,
     rng_key: jax.Array
-) -> SelfplayData:
+):
     """
     Generate batch of selfplay episodes.
 
-    Returns data for training: observations and MCTS targets at each step.
+    Returns (points, batch_data) where batch_data is tuple of:
+        (encoder_outputs, formula_tokens, positions, action_weights, rewards)
     """
     batch_size = selfplay_batch_size
 
@@ -186,166 +173,194 @@ def selfplay_episode(
     batch_data = jax.vmap(single_episode_fn)(points, encoder_outputs, episode_keys)
 
     # batch_data is tuple of arrays with shape (batch, max_steps, ...)
-    return SelfplayData(
-        encoder_outputs=batch_data[0],  # (batch, max_steps, max_points, n_embd)
-        formula_tokens=batch_data[1],  # (batch, max_steps, max_len)
-        positions=batch_data[2],  # (batch, max_steps)
-        action_weights=batch_data[3],  # (batch, max_steps, vocab_size)
-        rewards=batch_data[4],  # (batch, max_steps)
-    )
+    # batch_data[0]: encoder_outputs (batch, max_steps, max_points, n_embd)
+    # batch_data[1]: formula_tokens (batch, max_steps, max_len)
+    # batch_data[2]: positions (batch, max_steps)
+    # batch_data[3]: action_weights (batch, max_steps, vocab_size)
+    # batch_data[4]: rewards (batch, max_steps)
+    return points, batch_data
 
 
-class TrainingSample(NamedTuple):
-    """Training samples after processing selfplay data (batch of episodes)."""
-    encoder_output: jax.Array  # (batch, num_points, n_embd)
-    formula_tokens: jax.Array  # (batch, max_len)
-    positions: jax.Array  # (batch, max_steps) - position at each step
-    policy_targets: jax.Array  # (batch, max_steps, vocab_size) - action_weights from MCTS
-    value_targets: jax.Array  # (batch, max_steps) - final reward for each step
-    mask: jax.Array  # (batch, max_steps) bool - valid steps
+class SamplePool:
+    """Circular buffer for training samples using NumPy for mutability."""
+    def __init__(self, pool_size: int, num_points: int, num_variables: int, max_len: int, vocab_size: int):
+        self.pool_size = pool_size
+        self.write_index = 0
+        self.is_full = False
+
+        # Use NumPy arrays (mutable)
+        self.points = np.zeros((pool_size, num_points, num_variables), dtype=np.float32)
+        self.formula_tokens = np.zeros((pool_size, max_len), dtype=np.int32)
+        self.positions = np.zeros(pool_size, dtype=np.int32)
+        self.policy_targets = np.zeros((pool_size, vocab_size), dtype=np.float32)
+        self.value_targets = np.zeros(pool_size, dtype=np.float32)
+
+    def add_samples(self, points, formula_tokens, positions, policy_targets, value_targets):
+        """Add batch of samples to pool (circular overwrite)."""
+        # Convert JAX → NumPy
+        points = np.array(points)
+        formula_tokens = np.array(formula_tokens)
+        positions = np.array(positions)
+        policy_targets = np.array(policy_targets)
+        value_targets = np.array(value_targets)
+
+        num_new = len(points)
+        for i in range(num_new):
+            self.points[self.write_index] = points[i]
+            self.formula_tokens[self.write_index] = formula_tokens[i]
+            self.positions[self.write_index] = positions[i]
+            self.policy_targets[self.write_index] = policy_targets[i]
+            self.value_targets[self.write_index] = value_targets[i]
+            self.write_index = (self.write_index + 1) % self.pool_size
+            if self.write_index == 0:
+                self.is_full = True
+
+    def sample_batch(self, batch_size: int, rng_key: jax.Array):
+        """Sample random batch from pool."""
+        # Use NumPy random for sampling
+        indices = np.random.choice(self.pool_size, size=batch_size, replace=False)
+
+        # Convert NumPy → JAX for training
+        return (
+            jnp.array(self.points[indices]),
+            jnp.array(self.formula_tokens[indices]),
+            jnp.array(self.positions[indices]),
+            jnp.array(self.policy_targets[indices]),
+            jnp.array(self.value_targets[indices]),
+        )
 
 
-def compute_training_samples(data: SelfplayData) -> TrainingSample:
+def add_to_pool(points: jax.Array, batch_data: tuple, pool: SamplePool):
     """
-    Convert selfplay data to training samples.
+    Flatten selfplay data and add to sample pool.
 
-    Keeps batch structure (batch, max_steps) for efficient training.
-    - Input: (encoder_output, formula_tokens) per episode
-    - Targets: (policy_targets, value_targets) for all steps
+    Args:
+        points: (batch, num_points, num_variables)
+        batch_data: tuple of (encoder_outputs, formula_tokens, positions, action_weights, rewards)
+        pool: SamplePool to add samples to
     """
-    batch_size, max_steps = data.rewards.shape
+    encoder_outputs, formula_tokens, positions, action_weights, rewards = batch_data
+    batch_size, max_steps = rewards.shape
 
     # Compute value target for each step (final reward, no bootstrapping)
-    # Since rewards are sparse (only non-zero at termination), sum gives final reward
-    # Shape: (batch,)
-    final_rewards = jnp.sum(data.rewards, axis=1)
-    value_targets = jnp.broadcast_to(final_rewards[:, None], (batch_size, max_steps))
+    final_rewards = jnp.sum(rewards, axis=1)  # (batch,)
+    value_targets = jnp.broadcast_to(final_rewards[:, None], (batch_size, max_steps))  # (batch, max_steps)
 
     # Create mask for valid steps
-    # We assume reward != 0 indicates termination
-    terminated = data.rewards != 0.0
+    terminated = rewards != 0.0
     terminated_cumsum = jnp.cumsum(terminated, axis=1)
-    # Valid steps: before termination (cumsum == 0) or at termination (terminated == True)
-    # After termination, cumsum stays at 1 but terminated is False, so we mask those out
-    valid_mask = (terminated_cumsum == 0) | terminated
+    valid_mask = (terminated_cumsum == 0) | terminated  # (batch, max_steps)
 
-    # Extract final formula_tokens and encoder_output for each episode (last valid step)
+    # Extract final formula for each episode (last valid step)
     last_valid_idx = jnp.sum(valid_mask, axis=1) - 1  # (batch,)
-    final_formula_tokens = data.formula_tokens[jnp.arange(batch_size), last_valid_idx]  # (batch, max_len)
-    final_encoder_outputs = data.encoder_outputs[jnp.arange(batch_size), last_valid_idx]  # (batch, num_points, n_embd)
+    final_formulas = formula_tokens[jnp.arange(batch_size), last_valid_idx]  # (batch, max_len)
 
-    return TrainingSample(
-        encoder_output=final_encoder_outputs,  # (batch, num_points, n_embd)
-        formula_tokens=final_formula_tokens,  # (batch, max_len)
-        positions=data.positions,  # (batch, max_steps)
-        policy_targets=data.action_weights,  # (batch, max_steps, vocab_size)
-        value_targets=value_targets,  # (batch, max_steps)
-        mask=valid_mask,  # (batch, max_steps)
+    # Repeat points and final formula for each step
+    points_repeated = jnp.repeat(points[:, None, :, :], max_steps, axis=1)  # (batch, max_steps, num_points, num_variables)
+    formulas_repeated = jnp.repeat(final_formulas[:, None, :], max_steps, axis=1)  # (batch, max_steps, max_len)
+
+    # Flatten
+    points_flat = points_repeated.reshape(-1, points.shape[1], points.shape[2])  # (batch*max_steps, num_points, num_variables)
+    formula_tokens_flat = formulas_repeated.reshape(-1, final_formulas.shape[1])  # (batch*max_steps, max_len)
+    positions_flat = positions.reshape(-1)  # (batch*max_steps,)
+    policy_targets_flat = action_weights.reshape(-1, action_weights.shape[2])  # (batch*max_steps, vocab_size)
+    value_targets_flat = value_targets.reshape(-1)  # (batch*max_steps,)
+    mask_flat = valid_mask.reshape(-1)  # (batch*max_steps,)
+
+    # Filter by mask - only add valid samples
+    points_filtered = points_flat[mask_flat]
+    formula_tokens_filtered = formula_tokens_flat[mask_flat]
+    positions_filtered = positions_flat[mask_flat]
+    policy_targets_filtered = policy_targets_flat[mask_flat]
+    value_targets_filtered = value_targets_flat[mask_flat]
+
+    # Add to pool
+    pool.add_samples(
+        points_filtered,
+        formula_tokens_filtered,
+        positions_filtered,
+        policy_targets_filtered,
+        value_targets_filtered,
     )
 
 
-def loss_per_episode(
+def loss_per_sample(
     model: BoolformerTransformer,
-    encoder_output: jax.Array,  # (num_points, n_embd)
+    points: jax.Array,  # (num_points, num_variables)
     formula_tokens: jax.Array,  # (max_len,)
-    positions: jax.Array,  # (max_steps,) - position at each step
-    policy_targets: jax.Array,  # (max_steps, vocab_size)
-    value_targets: jax.Array,  # (max_steps,)
-    mask: jax.Array,  # (max_steps,) bool
-    failure_scale: jax.Array  # scalar
+    position: int,  # scalar
+    policy_target: jax.Array,  # (vocab_size,)
+    value_target: float,  # scalar
+    failure_scale: float  # scalar
 ):
-    """Compute loss for all steps in one episode."""
-    # Forward pass: decode formula once to get all position outputs
-    # vmap automatically handles batching when this is called with jax.vmap
-    policy_logits, values = model.decode_formula(
-        formula_tokens, encoder_output, decode=False
-    )
-    # policy_logits: (max_len, vocab_size), values: (max_len)
+    """Compute loss for single sample."""
+    # Encode points - add batch dim
+    encoder_output = model.encode_points(points[None, ...])[0]  # (num_points, n_embd)
 
-    # Extract predictions at each step's position
-    # positions are 1-indexed, convert to 0-indexed
-    indices = positions - 1  # (max_steps,)
-    policy_preds = policy_logits[indices]  # (max_steps, vocab_size)
-    value_preds = values[indices]  # (max_steps,)
+    # Forward pass - add batch dim
+    policy_logits, values = model.decode_formula(
+        formula_tokens[None, :], encoder_output[None, :, :], decode=False
+    )
+    # Remove batch dim: policy_logits: (max_len, vocab_size), values: (max_len)
+    policy_logits = policy_logits[0]
+    values = values[0]
+
+    # Extract prediction at position (1-indexed → 0-indexed)
+    policy_pred = policy_logits[position - 1]  # (vocab_size,)
+    value_pred = values[position - 1]  # scalar
 
     # Policy loss: cross-entropy with MCTS action weights
-    policy_losses = jax.vmap(optax.softmax_cross_entropy)(policy_preds, policy_targets)  # (max_steps,)
+    policy_loss = optax.softmax_cross_entropy(policy_pred, policy_target)
 
     # Value loss: L2 loss with final reward
-    # Broadcast value_targets if it's scalar to match value_preds shape
-    value_targets_broadcast = jnp.broadcast_to(value_targets, value_preds.shape)
-    value_losses = jax.vmap(optax.l2_loss)(value_preds, value_targets_broadcast)  # (max_steps,)
+    value_loss = optax.l2_loss(value_pred, value_target)
 
-    # Scale failures by ratio to balance gradient contribution
-    scales = jnp.where(value_targets_broadcast == -1.0, failure_scale, 1.0)  # (max_steps,)
+    # Scale failures to balance gradient contribution
+    scale = jnp.where(value_target == -1.0, failure_scale, 1.0)
 
-    # Apply mask and scaling
-    policy_losses = policy_losses * mask * scales
-    value_losses = value_losses * mask * scales
-
-    return policy_losses, value_losses
+    return policy_loss * scale, value_loss * scale
 
 
 def loss_fn(
     model: BoolformerTransformer,
-    samples: TrainingSample
+    points: jax.Array,  # (batch, num_points, num_variables)
+    formula_tokens: jax.Array,  # (batch, max_len)
+    positions: jax.Array,  # (batch,)
+    policy_targets: jax.Array,  # (batch, vocab_size)
+    value_targets: jax.Array,  # (batch,)
 ):
     """
-    Compute loss on batch of episodes.
+    Compute loss on batch of samples.
 
     Returns:
         total_loss, (policy_loss_mean, value_loss_mean)
     """
-    # Compute failure scale: num_failures / num_successes across all valid steps
-    num_success = jnp.sum((samples.value_targets == 1.0) & samples.mask)
-    num_failure = jnp.sum((samples.value_targets == -1.0) & samples.mask)
-
-    # Scale = num_failures / num_successes (add epsilon to avoid division by zero)
+    # Compute failure scale: num_failures / num_successes
+    num_success = jnp.sum(value_targets == 1.0)
+    num_failure = jnp.sum(value_targets == -1.0)
     failure_scale = num_failure / (num_success + 1e-8)
 
     # DEBUG: Print gradient scaling
     jax.debug.print("⚖️  [loss_fn] num_success={}, num_failure={}, failure_scale={}",
                     num_success, num_failure, failure_scale)
 
-    # Vmap over batch of episodes
+    # Vmap over batch
     batch_loss_fn = jax.vmap(
-        lambda e, f, p, pt, vt, m: loss_per_episode(model, e, f, p, pt, vt, m, failure_scale)
+        lambda p, f, pos, pt, vt: loss_per_sample(model, p, f, pos, pt, vt, failure_scale)
     )
 
     policy_losses, value_losses = batch_loss_fn(
-        samples.encoder_output,
-        samples.formula_tokens,
-        samples.positions,
-        samples.policy_targets,
-        samples.value_targets,
-        samples.mask,
+        points, formula_tokens, positions, policy_targets, value_targets
     )
-    # policy_losses, value_losses: (batch, max_steps)
+    # policy_losses, value_losses: (batch,)
 
-    # Mean over all valid steps
-    num_valid = jnp.sum(samples.mask) + 1e-8
-    policy_loss_mean = jnp.sum(policy_losses) / num_valid
-    value_loss_mean = jnp.sum(value_losses) / num_valid
+    # Mean over batch
+    policy_loss_mean = jnp.mean(policy_losses)
+    value_loss_mean = jnp.mean(value_losses)
 
     total_loss = policy_loss_mean + value_loss_mean
 
     return total_loss, (policy_loss_mean, value_loss_mean)
-
-
-def train_step(
-    model: BoolformerTransformer,
-    optimizer: nnx.Optimizer,
-    samples: TrainingSample
-):
-    """Single training step."""
-    # Compute gradients
-    grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
-    (loss, (policy_loss, value_loss)), grads = grad_fn(model, samples)
-
-    # Update parameters (new API requires both model and grads)
-    optimizer.update(model, grads)
-
-    return loss, policy_loss, value_loss
 
 
 def main():
@@ -400,6 +415,16 @@ Config:
     root_fn = create_root_fn(model, env)
     recurrent_fn = create_recurrent_fn(model, env)
 
+    # Initialize sample pool
+    pool = SamplePool(
+        pool_size=pool_size,
+        num_points=2 ** (num_variables - 1),  # Max minority points
+        num_variables=num_variables,
+        max_len=max_formula_length,
+        vocab_size=vocab_size,
+    )
+    print(f"Sample pool initialized with size {pool_size}")
+
     # Prepare checkpoint directory
     now = datetime.datetime.now()
     now_str = now.strftime("%Y%m%d_%H%M%S")
@@ -417,22 +442,31 @@ Config:
         # Selfplay
         print(f"[Iter {iteration:04d}] Running selfplay...")
         rng_key, subkey = jax.random.split(rng_key)
-        selfplay_data = selfplay_episode(model, env, root_fn, recurrent_fn, subkey)
+        points, batch_data = selfplay_episode(model, env, root_fn, recurrent_fn, subkey)
 
-        # Track episode success (check if episode has +1 or -1 anywhere)
-        num_success = jnp.sum(jnp.any(selfplay_data.rewards == 1.0, axis=1)).item()
-        num_fail = jnp.sum(jnp.any(selfplay_data.rewards == -1.0, axis=1)).item()
+        # Track episode success
+        rewards = batch_data[4]
+        num_success = jnp.sum(jnp.any(rewards == 1.0, axis=1)).item()
+        num_fail = jnp.sum(jnp.any(rewards == -1.0, axis=1)).item()
         success_rate = num_success / selfplay_batch_size
-
-        # Compute training samples
-        samples = compute_training_samples(selfplay_data)
-        num_valid = jnp.sum(samples.mask).item()
         print(f"  Episodes: {num_success}/{selfplay_batch_size} success ({success_rate:.1%}), {num_fail} fail")
-        print(f"  Generated {num_valid} training samples")
 
-        # Training
-        print(f"  Training...")
-        loss, policy_loss, value_loss = train_step(model, optimizer, samples)
+        # Add samples to pool
+        add_to_pool(points, batch_data, pool)
+        print(f"  Pool now has {pool.write_index} total samples added (full={pool.is_full})")
+
+        # Training (only if pool is full)
+        if not pool.is_full:
+            print(f"  Skipping training (pool not full yet)\n")
+            continue
+
+        print(f"  Training on batch of {training_batch_size}...")
+        rng_key, subkey = jax.random.split(rng_key)
+        grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
+        (loss, (policy_loss, value_loss)), grads = grad_fn(
+            model, *pool.sample_batch(training_batch_size, subkey)
+        )
+        optimizer.update(model, grads)
 
         iter_time = time.time() - iter_start
 
