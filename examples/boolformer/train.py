@@ -50,7 +50,7 @@ max_train_formula_length = 4  # Filter out formulas longer than this (None = no 
 # temperature = 1.0  # Not used (gumbel_muzero_policy uses Gumbel sampling, not temperature)
 learning_rate = 0.0002  # Matches Boolformer LEARNING_RATE
 training_batch_size = 16  # Minibatch size for training
-pool_size = 150  # Circular buffer size for sample pool
+pool_size = 20  # Circular buffer size for sample pool
 
 # Checkpointing
 checkpoint_interval = 1
@@ -205,20 +205,53 @@ class SamplePool:
         value_targets = np.array(value_targets)
 
         num_new = len(points)
-        for i in range(num_new):
-            self.points[self.write_index] = points[i]
-            self.formula_tokens[self.write_index] = formula_tokens[i]
-            self.positions[self.write_index] = positions[i]
-            self.policy_targets[self.write_index] = policy_targets[i]
-            self.value_targets[self.write_index] = value_targets[i]
-            self.write_index = (self.write_index + 1) % self.pool_size
-            if self.write_index == 0:
-                self.is_full = True
+        end_index = self.write_index + num_new
 
-    def sample_batch(self, batch_size: int, rng_key: jax.Array):
-        """Sample random batch from pool."""
-        # Use NumPy random for sampling
-        indices = np.random.choice(self.pool_size, size=batch_size, replace=False)
+        # Compute two slices: before wraparound and after
+        slice1_end = min(end_index, self.pool_size)
+        slice1_len = slice1_end - self.write_index
+        slice2_end = max(0, end_index - self.pool_size)
+
+        # Write both chunks
+        for dst_slice, src_slice in [
+            (slice(self.write_index, slice1_end), slice(0, slice1_len)),
+            (slice(0, slice2_end), slice(slice1_len, num_new))
+        ]:
+            self.points[dst_slice] = points[src_slice]
+            self.formula_tokens[dst_slice] = formula_tokens[src_slice]
+            self.positions[dst_slice] = positions[src_slice]
+            self.policy_targets[dst_slice] = policy_targets[src_slice]
+            self.value_targets[dst_slice] = value_targets[src_slice]
+
+        self.write_index = end_index % self.pool_size
+        if end_index >= self.pool_size:
+            self.is_full = True
+
+    def sample_batch(self, batch_size: int, rng_key: jax.Array, min_success_ratio: float = 0.25):
+        """
+        Sample random batch from pool with minimum success ratio.
+
+        Args:
+            batch_size: Number of samples to draw
+            rng_key: Not used (using NumPy random)
+            min_success_ratio: Minimum ratio of success samples: successes/total (default 0.25)
+        """
+        # Check pool composition
+        num_successes_pool = np.sum(self.value_targets == 1.0)
+        success_ratio_pool = num_successes_pool / self.pool_size
+
+        # Use uniform sampling by default
+        weights = None
+        if success_ratio_pool < min_success_ratio:
+            # Compute weight for successes to achieve minimum ratio
+            # target_ratio = w * ratio / (w * ratio + (1-ratio))
+            # Solving: w = target_ratio * (1-ratio) / (ratio * (1 - target_ratio))
+            success_weight = (min_success_ratio * (1 - success_ratio_pool)) / (success_ratio_pool * (1 - min_success_ratio) + 1e-8)
+            weights = np.where(self.value_targets == 1.0, success_weight, 1.0)
+            weights = weights / weights.sum()  # Normalize
+
+        # Sample with computed weights
+        indices = np.random.choice(self.pool_size, size=batch_size, replace=False, p=weights)
 
         # Convert NumPy → JAX for training
         return (
@@ -291,7 +324,6 @@ def loss_per_sample(
     position: int,  # scalar
     policy_target: jax.Array,  # (vocab_size,)
     value_target: float,  # scalar
-    failure_scale: float  # scalar
 ):
     """Compute loss for single sample."""
     # Encode points - add batch dim
@@ -315,10 +347,7 @@ def loss_per_sample(
     # Value loss: L2 loss with final reward
     value_loss = optax.l2_loss(value_pred, value_target)
 
-    # Scale failures to balance gradient contribution
-    scale = jnp.where(value_target == -1.0, failure_scale, 1.0)
-
-    return policy_loss * scale, value_loss * scale
+    return policy_loss, value_loss
 
 
 def loss_fn(
@@ -346,7 +375,7 @@ def loss_fn(
 
     # Vmap over batch
     batch_loss_fn = jax.vmap(
-        lambda p, f, pos, pt, vt: loss_per_sample(model, p, f, pos, pt, vt, failure_scale)
+        lambda p, f, pos, pt, vt: loss_per_sample(model, p, f, pos, pt, vt)
     )
 
     policy_losses, value_losses = batch_loss_fn(
@@ -354,9 +383,11 @@ def loss_fn(
     )
     # policy_losses, value_losses: (batch,)
 
-    # Mean over batch
-    policy_loss_mean = jnp.mean(policy_losses)
-    value_loss_mean = jnp.mean(value_losses)
+    # Weighted mean to balance failures vs successes
+    # weights = jnp.where(value_targets == -1.0, failure_scale, 1.0)  # (batch,)
+    weights = jnp.ones_like(value_targets)  # Uncomment to disable failure scaling
+    policy_loss_mean = jnp.sum(policy_losses * weights) / jnp.sum(weights)
+    value_loss_mean = jnp.sum(value_losses * weights) / jnp.sum(weights)
 
     total_loss = policy_loss_mean + value_loss_mean
 
