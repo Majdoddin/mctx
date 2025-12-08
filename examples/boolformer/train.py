@@ -44,13 +44,14 @@ n_decoder_layers=2
 # Training
 seed = 0
 max_num_iters = 20
-selfplay_batch_size = 3#128  # Formulas per iteration
+selfplay_batch_size = 20#128  # Formulas per iteration
 num_simulations = 3#8  # MCTS simulations per action
 max_train_formula_length = 4  # Filter out formulas longer than this (None = no filter)
+length_distribution = (0.0, 0.25, 0.25, 0.25, 0.25)  # Distribution of formula lengths (index 0 unused, 1-4 are lengths)
 # temperature = 1.0  # Not used (gumbel_muzero_policy uses Gumbel sampling, not temperature)
 learning_rate = 0.0002  # Matches Boolformer LEARNING_RATE
 training_batch_size = 16  # Minibatch size for training
-pool_size = 20  # Circular buffer size for sample pool
+pool_size = 70  # Circular buffer size for sample pool
 
 # Checkpointing
 checkpoint_interval = 1
@@ -99,7 +100,7 @@ def selfplay_single_episode(
             action_weights = policy_output.action_weights[0]  # Remove batch dim
 
             # DEBUG: Print MCTS output (train.py:112)
-            jax.debug.print("🎯 [MCTS] selected_action={}, action_weights={}", action, action_weights)
+            # jax.debug.print("🎯 [MCTS] selected_action={}, action_weights={}", action, action_weights)
 
             next_state, reward, terminated = env.step(state, action)
 
@@ -156,7 +157,7 @@ def selfplay_episode(
     # Generate minority points using Boolformer formula generator
     # TODO: Convert to JAX for JIT compilation (currently uses Python/NumPy)
     max_gen_length = max_train_formula_length if max_train_formula_length is not None else 50  # TODO: Make default configurable
-    points_array, polish_exprs = generate_formulas(batch_size, num_variables, max_gen_length)
+    points_array, polish_exprs = generate_formulas(batch_size, num_variables, max_gen_length, length_distribution)
     points = jnp.array(points_array)  # (batch_size, max_points, num_variables)
 
     # Batch encode all points at once: (batch_size, max_points, num_variables) -> (batch_size, max_points, n_embd)
@@ -178,7 +179,7 @@ def selfplay_episode(
     # batch_data[2]: positions (batch, max_steps)
     # batch_data[3]: action_weights (batch, max_steps, vocab_size)
     # batch_data[4]: rewards (batch, max_steps)
-    return points, batch_data
+    return points, batch_data, polish_exprs
 
 
 class SamplePool:
@@ -473,14 +474,24 @@ Config:
         # Selfplay
         print(f"[Iter {iteration:04d}] Running selfplay...")
         rng_key, subkey = jax.random.split(rng_key)
-        points, batch_data = selfplay_episode(model, env, root_fn, recurrent_fn, subkey)
+        points, batch_data, polish_exprs = selfplay_episode(model, env, root_fn, recurrent_fn, subkey)
 
         # Track episode success
         rewards = batch_data[4]
-        num_success = jnp.sum(jnp.any(rewards == 1.0, axis=1)).item()
-        num_fail = jnp.sum(jnp.any(rewards == -1.0, axis=1)).item()
+        episode_success = jnp.any(rewards == 1.0, axis=1)  # (batch,)
+        num_success = jnp.sum(episode_success).item()
         success_rate = num_success / selfplay_batch_size
-        print(f"  Episodes: {num_success}/{selfplay_batch_size} success ({success_rate:.1%}), {num_fail} fail")
+
+        # Count successes per length
+        success_counts = np.zeros(len(length_distribution), dtype=int)
+        for i, expr in enumerate(polish_exprs):
+            if episode_success[i]:
+                success_counts[len(expr)] += 1
+
+        # Print overall and per-length stats
+        length_stats = " | ".join([f"L{i}:{success_counts[i]}/{int(np.ceil(selfplay_batch_size * length_distribution[i]))}({100*success_counts[i]/max(1,np.ceil(selfplay_batch_size * length_distribution[i])):.0f}%)"
+                                   for i in range(1, len(length_distribution)) if length_distribution[i] > 0])
+        print(f"  Episodes: {num_success}/{selfplay_batch_size} ({success_rate:.1%}) | {length_stats}")
 
         # Add samples to pool
         add_to_pool(points, batch_data, pool)

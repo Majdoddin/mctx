@@ -54,7 +54,7 @@ def create_root_fn(model: BoolformerTransformer, env: BoolformerEnv):
         next_token_logits = policy_logits[:, state.position - 1, :]  # (batch, vocab_size)
 
         # DEBUG: Print value prediction in root_fn
-        jax.debug.print("🔍 [root_fn] position={}, value={}", state.position, current_value[0])
+        # jax.debug.print("🔍 [root_fn] position={}, value={}", state.position, current_value[0])
 
         # Apply legal action mask
         legal_actions = env.get_legal_actions(state)
@@ -67,9 +67,9 @@ def create_root_fn(model: BoolformerTransformer, env: BoolformerEnv):
         )
 
         # DEBUG: Print action logits before MCTS (mcts_integration.py:66)
-        jax.debug.print("🔍 [root_fn] legal_actions={}", legal_actions)
-        jax.debug.print("🔍 [root_fn] raw_logits (before mask)={}", next_token_logits[0])
-        jax.debug.print("🔍 [root_fn] masked_logits={}", masked_logits[0])
+        # jax.debug.print("🔍 [root_fn] legal_actions={}", legal_actions)
+        # jax.debug.print("🔍 [root_fn] raw_logits (before mask)={}", next_token_logits[0])
+        # jax.debug.print("🔍 [root_fn] masked_logits={}", masked_logits[0])
 
         # Add batch dimension to all state fields for mctx embedding
         def add_batch_dim(arr):
@@ -152,8 +152,8 @@ def create_recurrent_fn(model: BoolformerTransformer, env: BoolformerEnv):
         next_token_logits = policy_logits[:, next_state.position - 1, :]  # (batch, vocab_size)
 
         # DEBUG: Print value prediction in recurrent_fn
-        jax.debug.print("🔍 [recurrent_fn] action={}, next_position={}, reward={}, value={}",
-                        single_action, next_state.position, reward, current_value[0])
+        # jax.debug.print("🔍 [recurrent_fn] action={}, next_position={}, reward={}, value={}",
+        #                 single_action, next_state.position, reward, current_value[0])
 
         # Apply legal action mask
         legal_actions = env.get_legal_actions(next_state)
@@ -165,8 +165,8 @@ def create_recurrent_fn(model: BoolformerTransformer, env: BoolformerEnv):
         )
 
         # DEBUG: Print action logits in recurrent_fn (mcts_integration.py:161)
-        jax.debug.print("🔍 [recurrent_fn] legal_actions={}", legal_actions)
-        jax.debug.print("🔍 [recurrent_fn] masked_logits={}", masked_logits[0])
+        # jax.debug.print("🔍 [recurrent_fn] legal_actions={}", legal_actions)
+        # jax.debug.print("🔍 [recurrent_fn] masked_logits={}", masked_logits[0])
 
         # Add batch dimension to next_state for mctx embedding
         def add_batch_dim(arr):

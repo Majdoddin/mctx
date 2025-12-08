@@ -21,7 +21,7 @@ def token_to_id(token):
     else: return 4 + int(token[1:])  # x1->5, x2->6, ..., x10->14
 
 
-def generate_formulas(n, num_variables, max_formula_length):
+def generate_formulas(n, num_variables, max_formula_length, length_distribution=None):
     """
     Generate n formulas following Boolformer approach.
 
@@ -29,6 +29,8 @@ def generate_formulas(n, num_variables, max_formula_length):
         n: Number of formulas to generate
         num_variables: Number of boolean variables (overrides config ACTIVE_VAR and DIMENSION_MAX)
         max_formula_length: Maximum length of generated formulas (in tokens)
+        length_distribution: list/tuple where index i is the proportion for length i (e.g., (0.0, 0.25, 0.25, 0.25, 0.25))
+                           Index 0 is unused. If None, accepts all formulas up to max_formula_length uniformly
 
     Returns (points_array, polish_exprs) where:
     - points_array: shape (n, max_points, num_variables) where max_points = 2^(num_variables-1)
@@ -47,6 +49,10 @@ def generate_formulas(n, num_variables, max_formula_length):
     # Override config to match num_variables
     config.ACTIVE_VAR = num_variables
     config.DIMENSION_MAX = num_variables
+
+    # Track collected counts per length if distribution specified (index 0 unused)
+    collected_counts = np.zeros(max_formula_length + 1, dtype=int) if length_distribution is not None else None
+
     points_list = []
     polish_exprs = []
 
@@ -73,9 +79,16 @@ def generate_formulas(n, num_variables, max_formula_length):
             else:
                 polish_expr = formula.polish_expr
 
-            # Skip if formula is too long
-            if len(polish_expr) > max_formula_length:
+            # Check length constraints
+            formula_length = len(polish_expr)
+            if formula_length > max_formula_length:
                 continue
+
+            # Check length distribution if specified
+            if length_distribution is not None:
+                if collected_counts[formula_length] >= np.ceil(n * length_distribution[formula_length]):
+                    continue  # Bucket full, skip
+                collected_counts[formula_length] += 1
 
             # Extract points where output is 1 (the minority class)
             minority_mask = (outputs == 1)
