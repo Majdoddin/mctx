@@ -36,10 +36,10 @@ max_formula_length = 4 + 1 #+1 for SOS
 # n_decoder_layers = 8  # NUM_DECODER_LAYERS
 
 # CPU/test config:
-n_embd=128
+n_embd=64
 n_head=8
-n_encoder_layers=2
-n_decoder_layers=2
+n_encoder_layers=1
+n_decoder_layers=1
 
 # Training
 seed = 0
@@ -47,11 +47,14 @@ max_num_iters = 20
 selfplay_batch_size = 20#128  # Formulas per iteration
 num_simulations = 3#8  # MCTS simulations per action
 max_train_formula_length = 4  # Filter out formulas longer than this (None = no filter)
-length_distribution = (0.0, 0.25, 0.25, 0.25, 0.25)  # Distribution of formula lengths (index 0 unused, 1-4 are lengths)
+length_distribution = [0.0, 0.25, 0.25, 0.3, 0.2]  # Distribution for generating formulas (index 0 unused, 1-4 are lengths). Updated by curriculum.
+training_length_distribution = [0.0, 0.25, 0.25, 0.25, 0.25]  # Distribution for sampling training batches. Updated by curriculum.
+min_success_ratio_per_length = (0.0, 0.25, 0.1, 0.1, 0.1)  # Minimum success ratio for each length in training batch
+min_length_proportion = (0.0, 0.05, 0.05, 0.05, 0.0)  # Minimum proportion for each length when success rate is 1.0 (last is computed)
 # temperature = 1.0  # Not used (gumbel_muzero_policy uses Gumbel sampling, not temperature)
 learning_rate = 0.0002  # Matches Boolformer LEARNING_RATE
-training_batch_size = 16  # Minibatch size for training
-pool_size = 70  # Circular buffer size for sample pool
+training_batch_size = 32  # Minibatch size for training
+pool_size = 200  # Circular buffer size for sample pool
 
 # Checkpointing
 checkpoint_interval = 1
@@ -228,30 +231,51 @@ class SamplePool:
         if end_index >= self.pool_size:
             self.is_full = True
 
-    def sample_batch(self, batch_size: int, rng_key: jax.Array, min_success_ratio: float = 0.25):
+    def sample_batch(self, batch_size: int, rng_key: jax.Array, length_distribution, min_success_ratio_per_length):
         """
-        Sample random batch from pool with minimum success ratio.
+        Sample batch from pool with length distribution and per-length success ratios.
 
         Args:
             batch_size: Number of samples to draw
             rng_key: Not used (using NumPy random)
-            min_success_ratio: Minimum ratio of success samples: successes/total (default 0.25)
+            length_distribution: tuple of proportions per length (e.g., (0.0, 0.2, 0.3, 0.25, 0.25))
+            min_success_ratio_per_length: tuple of min success ratios per length (e.g., (0.0, 0.2, 0.3, 0.2, 0.1))
         """
-        # Check pool composition
-        num_successes_pool = np.sum(self.value_targets == 1.0)
-        success_ratio_pool = num_successes_pool / self.pool_size
+        # Compute formula lengths (count non-padding tokens, exclude SOS at position 0)
+        # <PAD> = 1, <SOS> = 0
+        formula_lengths = np.sum(self.formula_tokens[:, 1:] != 1, axis=1)
 
-        # Use uniform sampling by default
-        weights = None
-        if success_ratio_pool < min_success_ratio:
-            # Compute weight for successes to achieve minimum ratio
-            # target_ratio = w * ratio / (w * ratio + (1-ratio))
-            # Solving: w = target_ratio * (1-ratio) / (ratio * (1 - target_ratio))
-            success_weight = (min_success_ratio * (1 - success_ratio_pool)) / (success_ratio_pool * (1 - min_success_ratio) + 1e-8)
-            weights = np.where(self.value_targets == 1.0, success_weight, 1.0)
-            weights = weights / weights.sum()  # Normalize
+        max_len = len(length_distribution)
 
-        # Sample with computed weights
+        # Pass 1: Gather statistics per length
+        total_count = np.zeros(max_len, dtype=int)
+        success_count = np.zeros(max_len, dtype=int)
+        success_ratio = np.zeros(max_len, dtype=float)
+
+        for length in range(1, max_len):
+            length_mask = (formula_lengths == length)
+            total_count[length] = length_mask.sum()
+            if total_count[length] > 0:
+                success_count[length] = ((self.value_targets == 1.0) & length_mask).sum()
+                success_ratio[length] = success_count[length] / total_count[length]
+
+        # Pass 2: Compute weights per sample
+        weights = np.array(length_distribution)[formula_lengths]  # Start with length distribution
+
+        # Boost successes for lengths that need more successes
+        # NOTE: Boosting successes increases total weight for that length, breaking exact length distribution.
+        # To maintain exact distribution, would need to proportionally reduce failures.
+        for length in range(1, max_len):
+            if success_ratio[length] < min_success_ratio_per_length[length] and success_ratio[length] > 0:
+                # Compute boost factor to achieve target success ratio
+                boost = (min_success_ratio_per_length[length] * (1 - success_ratio[length])) / (success_ratio[length] * (1 - min_success_ratio_per_length[length]) + 1e-8)
+
+                # Apply boost to successes of this length
+                length_and_success = (formula_lengths == length) & (self.value_targets == 1.0)
+                weights[length_and_success] *= boost
+
+        # Normalize and sample
+        weights = weights / weights.sum()
         indices = np.random.choice(self.pool_size, size=batch_size, replace=False, p=weights)
 
         # Convert NumPy → JAX for training
@@ -395,11 +419,10 @@ def loss_fn(
     return total_loss, (policy_loss_mean, value_loss_mean)
 
 
-def main():
-    print("=" * 80)
-    print("BOOLFORMER MCTS TRAINING")
-    print("=" * 80)
-    print(f"""
+print("=" * 80)
+print("BOOLFORMER MCTS TRAINING")
+print("=" * 80)
+print(f"""
 Config:
   num_variables={num_variables}
   vocab_size={vocab_size}
@@ -414,122 +437,173 @@ Config:
   checkpoint_interval={checkpoint_interval}
 """)
 
-    # Initialize model
-    print("Initializing model...")
-    rngs = nnx.Rngs(seed)
-    model = BoolformerTransformer(
-        rngs=rngs,
-        num_variables=num_variables,
-        vocab_size=vocab_size,
-        max_formula_length=max_formula_length,
-        n_embd=n_embd,
-        n_head=n_head,
-        n_encoder_layers=n_encoder_layers,
-        n_decoder_layers=n_decoder_layers,
+# Initialize model
+print("Initializing model...")
+rngs = nnx.Rngs(seed)
+model = BoolformerTransformer(
+    rngs=rngs,
+    num_variables=num_variables,
+    vocab_size=vocab_size,
+    max_formula_length=max_formula_length,
+    n_embd=n_embd,
+    n_head=n_head,
+    n_encoder_layers=n_encoder_layers,
+    n_decoder_layers=n_decoder_layers,
+)
+
+# Reinitialize weights following nanochat scheme
+print("Reinitializing weights with nanochat scheme...")
+model.init_weights()
+
+# Initialize optimizer (use all model parameters)
+optimizer = nnx.Optimizer(model, optax.adam(learning_rate), wrt=nnx.All(nnx.Param))
+
+# Initialize environment
+env_config = BoolformerConfig(
+    num_variables=num_variables,
+    vocab_size=vocab_size,
+    max_formula_length=max_formula_length,
+)
+env = BoolformerEnv(model, env_config)
+
+# Create MCTS functions once (reused across all iterations)
+root_fn = create_root_fn(model, env)
+recurrent_fn = create_recurrent_fn(model, env)
+
+# Initialize sample pool
+pool = SamplePool(
+    pool_size=pool_size,
+    num_points=2 ** (num_variables - 1),  # Max minority points
+    num_variables=num_variables,
+    max_len=max_formula_length,
+    vocab_size=vocab_size,
+)
+print(f"Sample pool initialized with size {pool_size}")
+
+# Prepare checkpoint directory
+now = datetime.datetime.now()
+now_str = now.strftime("%Y%m%d_%H%M%S")
+ckpt_dir = os.path.join("checkpoints", f"boolformer_{now_str}")
+os.makedirs(ckpt_dir, exist_ok=True)
+print(f"Checkpoints: {ckpt_dir}")
+
+def update_curriculum(success_counts, total_counts):
+    """
+    Update length_distribution and training_length_distribution based on success rates.
+
+    Generation distribution: Higher need (lower success) → higher proportion
+    Training distribution: Only include lengths with enough success samples
+    """
+    max_len = len(length_distribution)
+    new_gen_dist = [0.0] * max_len
+    new_train_dist = [0.0] * max_len
+
+    # Compute success rates
+    success_rates = np.zeros(max_len)
+    for length in range(1, max_len):
+        if total_counts[length] > 0:
+            success_rates[length] = success_counts[length] / total_counts[length]
+
+    # Update generation distribution for lengths 1 to max_len-2
+    for length in range(1, max_len - 1):
+        need = 1.0 - success_rates[length]  # 0.0 if perfect, 1.0 if failing
+        new_gen_dist[length] = min_length_proportion[length] + need * 0.3
+
+    # Last length gets remainder
+    new_gen_dist[max_len - 1] = max(0.0, 1.0 - sum(new_gen_dist[1:max_len-1]))
+
+    # Update training distribution
+    for length in range(1, max_len):
+        # Must have successes if min_success_ratio > 0
+        if min_success_ratio_per_length[length] > 0 and success_counts[length] == 0:
+            new_train_dist[length] = 0.0
+        else:
+            new_train_dist[length] = new_gen_dist[length]
+
+    # Normalize training distribution
+    total_train = sum(new_train_dist[1:])
+    if total_train > 0:
+        for length in range(1, max_len):
+            new_train_dist[length] /= total_train
+
+    return new_gen_dist, new_train_dist
+
+# Training loop
+rng_key = jax.random.key(seed)
+
+print("\nStarting training...\n")
+for iteration in range(max_num_iters):
+    iter_start = time.time()
+
+    # Selfplay
+    print(f"[Iter {iteration:04d}] Running selfplay...")
+    rng_key, subkey = jax.random.split(rng_key)
+    points, batch_data, polish_exprs = selfplay_episode(model, env, root_fn, recurrent_fn, subkey)
+
+    # Track episode success
+    rewards = batch_data[4]
+    episode_success = jnp.any(rewards == 1.0, axis=1)  # (batch,)
+    num_success = jnp.sum(episode_success).item()
+    success_rate = num_success / selfplay_batch_size
+
+    # Count successes per length
+    success_counts = np.zeros(len(length_distribution), dtype=int)
+    for i, expr in enumerate(polish_exprs):
+        if episode_success[i]:
+            success_counts[len(expr)] += 1
+
+    # Print overall and per-length stats
+    length_stats = " | ".join([f"L{i}:{success_counts[i]}/{int(np.ceil(selfplay_batch_size * length_distribution[i]))}({100*success_counts[i]/max(1,np.ceil(selfplay_batch_size * length_distribution[i])):.0f}%)"
+                               for i in range(1, len(length_distribution)) if length_distribution[i] > 0])
+    print(f"  Episodes: {num_success}/{selfplay_batch_size} ({success_rate:.1%}) | {length_stats}")
+
+    # Add samples to pool
+    add_to_pool(points, batch_data, pool)
+    print(f"  Pool now has {pool.write_index} total samples added (full={pool.is_full})")
+
+    # Training (only if pool is full)
+    if not pool.is_full:
+        print(f"  Skipping training (pool not full yet)\n")
+        continue
+
+    # Update curriculum based on pool statistics
+    pool_formula_lengths = np.sum(pool.formula_tokens[:, 1:] != 1, axis=1)
+    pool_total_counts = np.zeros(len(length_distribution), dtype=int)
+    pool_success_counts = np.zeros(len(length_distribution), dtype=int)
+    for length in range(1, len(length_distribution)):
+        length_mask = (pool_formula_lengths == length)
+        pool_total_counts[length] = length_mask.sum()
+        pool_success_counts[length] = ((pool.value_targets == 1.0) & length_mask).sum()
+
+    length_distribution[:], training_length_distribution[:] = update_curriculum(pool_success_counts, pool_total_counts)
+    print(f"  Curriculum: gen={[f'{x:.2f}' for x in length_distribution[1:]]}, train={[f'{x:.2f}' for x in training_length_distribution[1:]]}")
+
+    print(f"  Training on batch of {training_batch_size}...")
+    rng_key, subkey = jax.random.split(rng_key)
+    grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
+    (loss, (policy_loss, value_loss)), grads = grad_fn(
+        model, *pool.sample_batch(training_batch_size, subkey, training_length_distribution, min_success_ratio_per_length)
     )
+    optimizer.update(model, grads)
 
-    # Reinitialize weights following nanochat scheme
-    print("Reinitializing weights with nanochat scheme...")
-    model.init_weights()
+    iter_time = time.time() - iter_start
 
-    # Initialize optimizer (use all model parameters)
-    optimizer = nnx.Optimizer(model, optax.adam(learning_rate), wrt=nnx.All(nnx.Param))
+    print(f"  Loss: {loss:.4f} (policy={policy_loss:.4f}, value={value_loss:.4f})")
+    print(f"  Time: {iter_time:.2f}s\n")
 
-    # Initialize environment
-    env_config = BoolformerConfig(
-        num_variables=num_variables,
-        vocab_size=vocab_size,
-        max_formula_length=max_formula_length,
-    )
-    env = BoolformerEnv(model, env_config)
+    # Checkpoint
+    if iteration % checkpoint_interval == 0:
+        ckpt_path = os.path.join(ckpt_dir, f"iter_{iteration:06d}.ckpt")
+        with open(ckpt_path, "wb") as f:
+            state_dict = nnx.state(model)
+            pickle.dump({
+                "model_state": state_dict,
+                "iteration": iteration,
+            }, f)
+        print(f"  Saved checkpoint: {ckpt_path}\n")
 
-    # Create MCTS functions once (reused across all iterations)
-    root_fn = create_root_fn(model, env)
-    recurrent_fn = create_recurrent_fn(model, env)
-
-    # Initialize sample pool
-    pool = SamplePool(
-        pool_size=pool_size,
-        num_points=2 ** (num_variables - 1),  # Max minority points
-        num_variables=num_variables,
-        max_len=max_formula_length,
-        vocab_size=vocab_size,
-    )
-    print(f"Sample pool initialized with size {pool_size}")
-
-    # Prepare checkpoint directory
-    now = datetime.datetime.now()
-    now_str = now.strftime("%Y%m%d_%H%M%S")
-    ckpt_dir = os.path.join("checkpoints", f"boolformer_{now_str}")
-    os.makedirs(ckpt_dir, exist_ok=True)
-    print(f"Checkpoints: {ckpt_dir}")
-
-    # Training loop
-    rng_key = jax.random.key(seed)
-
-    print("\nStarting training...\n")
-    for iteration in range(max_num_iters):
-        iter_start = time.time()
-
-        # Selfplay
-        print(f"[Iter {iteration:04d}] Running selfplay...")
-        rng_key, subkey = jax.random.split(rng_key)
-        points, batch_data, polish_exprs = selfplay_episode(model, env, root_fn, recurrent_fn, subkey)
-
-        # Track episode success
-        rewards = batch_data[4]
-        episode_success = jnp.any(rewards == 1.0, axis=1)  # (batch,)
-        num_success = jnp.sum(episode_success).item()
-        success_rate = num_success / selfplay_batch_size
-
-        # Count successes per length
-        success_counts = np.zeros(len(length_distribution), dtype=int)
-        for i, expr in enumerate(polish_exprs):
-            if episode_success[i]:
-                success_counts[len(expr)] += 1
-
-        # Print overall and per-length stats
-        length_stats = " | ".join([f"L{i}:{success_counts[i]}/{int(np.ceil(selfplay_batch_size * length_distribution[i]))}({100*success_counts[i]/max(1,np.ceil(selfplay_batch_size * length_distribution[i])):.0f}%)"
-                                   for i in range(1, len(length_distribution)) if length_distribution[i] > 0])
-        print(f"  Episodes: {num_success}/{selfplay_batch_size} ({success_rate:.1%}) | {length_stats}")
-
-        # Add samples to pool
-        add_to_pool(points, batch_data, pool)
-        print(f"  Pool now has {pool.write_index} total samples added (full={pool.is_full})")
-
-        # Training (only if pool is full)
-        if not pool.is_full:
-            print(f"  Skipping training (pool not full yet)\n")
-            continue
-
-        print(f"  Training on batch of {training_batch_size}...")
-        rng_key, subkey = jax.random.split(rng_key)
-        grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
-        (loss, (policy_loss, value_loss)), grads = grad_fn(
-            model, *pool.sample_batch(training_batch_size, subkey)
-        )
-        optimizer.update(model, grads)
-
-        iter_time = time.time() - iter_start
-
-        print(f"  Loss: {loss:.4f} (policy={policy_loss:.4f}, value={value_loss:.4f})")
-        print(f"  Time: {iter_time:.2f}s\n")
-
-        # Checkpoint
-        if iteration % checkpoint_interval == 0:
-            ckpt_path = os.path.join(ckpt_dir, f"iter_{iteration:06d}.ckpt")
-            with open(ckpt_path, "wb") as f:
-                state_dict = nnx.state(model)
-                pickle.dump({
-                    "model_state": state_dict,
-                    "iteration": iteration,
-                }, f)
-            print(f"  Saved checkpoint: {ckpt_path}\n")
-
-    print("=" * 80)
-    print("TRAINING COMPLETE")
-    print("=" * 80)
+print("=" * 80)
+print("TRAINING COMPLETE")
+print("=" * 80)
 
 
-if __name__ == "__main__":
-    main()
