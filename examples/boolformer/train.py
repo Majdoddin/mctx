@@ -190,6 +190,7 @@ class SamplePool:
     def __init__(self, pool_size: int, num_points: int, num_variables: int, max_len: int, vocab_size: int):
         self.pool_size = pool_size
         self.write_index = 0
+        self.total_written = 0  # Track total samples written
         self.is_full = False
 
         # Use NumPy arrays (mutable)
@@ -210,28 +211,29 @@ class SamplePool:
         value_targets = np.array(value_targets)
 
         num_new = len(points)
-        end_index = self.write_index + num_new
 
-        # Compute two slices: before wraparound and after
-        slice1_end = min(end_index, self.pool_size)
-        slice1_len = slice1_end - self.write_index
-        slice2_end = max(0, end_index - self.pool_size)
+        # Write samples one by one, skipping protected slots (length-4 successes)
+        write_idx = self.write_index
+        for src_idx in range(num_new):
+            # Skip protected slots: length-4 successes
+            while (self.target_polish_exprs[write_idx] is not None and
+                   len(self.target_polish_exprs[write_idx]) == 4 and
+                   self.value_targets[write_idx] == 1.0):
+                write_idx = (write_idx + 1) % self.pool_size
 
-        # Write both chunks
-        for dst_slice, src_slice in [
-            (slice(self.write_index, slice1_end), slice(0, slice1_len)),
-            (slice(0, slice2_end), slice(slice1_len, num_new))
-        ]:
-            self.points[dst_slice] = points[src_slice]
-            self.formula_tokens[dst_slice] = formula_tokens[src_slice]
-            self.positions[dst_slice] = positions[src_slice]
-            self.policy_targets[dst_slice] = policy_targets[src_slice]
-            self.value_targets[dst_slice] = value_targets[src_slice]
-            # Copy polish exprs (Python list)
-            self.target_polish_exprs[dst_slice] = target_polish_exprs[src_slice]
+            # Write sample
+            self.points[write_idx] = points[src_idx]
+            self.formula_tokens[write_idx] = formula_tokens[src_idx]
+            self.target_polish_exprs[write_idx] = target_polish_exprs[src_idx]
+            self.positions[write_idx] = positions[src_idx]
+            self.policy_targets[write_idx] = policy_targets[src_idx]
+            self.value_targets[write_idx] = value_targets[src_idx]
 
-        self.write_index = end_index % self.pool_size
-        if end_index >= self.pool_size:
+            write_idx = (write_idx + 1) % self.pool_size
+
+        self.write_index = write_idx
+        self.total_written += num_new
+        if self.total_written >= self.pool_size:
             self.is_full = True
 
     def sample_batch(self, batch_size: int, rng_key: jax.Array, length_distribution, min_success_ratio_per_length):
