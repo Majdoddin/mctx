@@ -195,11 +195,12 @@ class SamplePool:
         # Use NumPy arrays (mutable)
         self.points = np.zeros((pool_size, num_points, num_variables), dtype=np.float32)
         self.formula_tokens = np.zeros((pool_size, max_len), dtype=np.int32)
+        self.target_polish_exprs = [None] * pool_size  # Target formula from generator (list of token strings)
         self.positions = np.zeros(pool_size, dtype=np.int32)
         self.policy_targets = np.zeros((pool_size, vocab_size), dtype=np.float32)
         self.value_targets = np.zeros(pool_size, dtype=np.float32)
 
-    def add_samples(self, points, formula_tokens, positions, policy_targets, value_targets):
+    def add_samples(self, points, formula_tokens, target_polish_exprs, positions, policy_targets, value_targets):
         """Add batch of samples to pool (circular overwrite)."""
         # Convert JAX → NumPy
         points = np.array(points)
@@ -226,6 +227,8 @@ class SamplePool:
             self.positions[dst_slice] = positions[src_slice]
             self.policy_targets[dst_slice] = policy_targets[src_slice]
             self.value_targets[dst_slice] = value_targets[src_slice]
+            # Copy polish exprs (Python list)
+            self.target_polish_exprs[dst_slice] = target_polish_exprs[src_slice]
 
         self.write_index = end_index % self.pool_size
         if end_index >= self.pool_size:
@@ -287,59 +290,66 @@ class SamplePool:
             jnp.array(self.value_targets[indices]),
         )
 
+    def add_from_batch(self, points: jax.Array, batch_data: tuple, polish_exprs: list):
+        """
+        Flatten selfplay data and add to sample pool.
 
-def add_to_pool(points: jax.Array, batch_data: tuple, pool: SamplePool):
-    """
-    Flatten selfplay data and add to sample pool.
+        Args:
+            points: (batch, num_points, num_variables)
+            batch_data: tuple of (encoder_outputs, formula_tokens, positions, action_weights, rewards)
+            polish_exprs: list of target polish expressions (one per episode)
+        """
+        encoder_outputs, formula_tokens, positions, action_weights, rewards = batch_data
+        batch_size, max_steps = rewards.shape
 
-    Args:
-        points: (batch, num_points, num_variables)
-        batch_data: tuple of (encoder_outputs, formula_tokens, positions, action_weights, rewards)
-        pool: SamplePool to add samples to
-    """
-    encoder_outputs, formula_tokens, positions, action_weights, rewards = batch_data
-    batch_size, max_steps = rewards.shape
+        # Compute value target for each step (final reward, no bootstrapping)
+        final_rewards = jnp.sum(rewards, axis=1)  # (batch,)
+        value_targets = jnp.broadcast_to(final_rewards[:, None], (batch_size, max_steps))  # (batch, max_steps)
 
-    # Compute value target for each step (final reward, no bootstrapping)
-    final_rewards = jnp.sum(rewards, axis=1)  # (batch,)
-    value_targets = jnp.broadcast_to(final_rewards[:, None], (batch_size, max_steps))  # (batch, max_steps)
+        # Create mask for valid steps
+        terminated = rewards != 0.0
+        terminated_cumsum = jnp.cumsum(terminated, axis=1)
+        valid_mask = (terminated_cumsum == 0) | terminated  # (batch, max_steps)
 
-    # Create mask for valid steps
-    terminated = rewards != 0.0
-    terminated_cumsum = jnp.cumsum(terminated, axis=1)
-    valid_mask = (terminated_cumsum == 0) | terminated  # (batch, max_steps)
+        # Extract final formula for each episode (last valid step)
+        last_valid_idx = jnp.sum(valid_mask, axis=1) - 1  # (batch,)
+        final_formulas = formula_tokens[jnp.arange(batch_size), last_valid_idx]  # (batch, max_len)
 
-    # Extract final formula for each episode (last valid step)
-    last_valid_idx = jnp.sum(valid_mask, axis=1) - 1  # (batch,)
-    final_formulas = formula_tokens[jnp.arange(batch_size), last_valid_idx]  # (batch, max_len)
+        # Repeat points and final formula for each step
+        points_repeated = jnp.repeat(points[:, None, :, :], max_steps, axis=1)  # (batch, max_steps, num_points, num_variables)
+        formulas_repeated = jnp.repeat(final_formulas[:, None, :], max_steps, axis=1)  # (batch, max_steps, max_len)
 
-    # Repeat points and final formula for each step
-    points_repeated = jnp.repeat(points[:, None, :, :], max_steps, axis=1)  # (batch, max_steps, num_points, num_variables)
-    formulas_repeated = jnp.repeat(final_formulas[:, None, :], max_steps, axis=1)  # (batch, max_steps, max_len)
+        # Flatten
+        points_flat = points_repeated.reshape(-1, points.shape[1], points.shape[2])  # (batch*max_steps, num_points, num_variables)
+        formula_tokens_flat = formulas_repeated.reshape(-1, final_formulas.shape[1])  # (batch*max_steps, max_len)
+        positions_flat = positions.reshape(-1)  # (batch*max_steps,)
+        policy_targets_flat = action_weights.reshape(-1, action_weights.shape[2])  # (batch*max_steps, vocab_size)
+        value_targets_flat = value_targets.reshape(-1)  # (batch*max_steps,)
+        mask_flat = valid_mask.reshape(-1)  # (batch*max_steps,)
 
-    # Flatten
-    points_flat = points_repeated.reshape(-1, points.shape[1], points.shape[2])  # (batch*max_steps, num_points, num_variables)
-    formula_tokens_flat = formulas_repeated.reshape(-1, final_formulas.shape[1])  # (batch*max_steps, max_len)
-    positions_flat = positions.reshape(-1)  # (batch*max_steps,)
-    policy_targets_flat = action_weights.reshape(-1, action_weights.shape[2])  # (batch*max_steps, vocab_size)
-    value_targets_flat = value_targets.reshape(-1)  # (batch*max_steps,)
-    mask_flat = valid_mask.reshape(-1)  # (batch*max_steps,)
+        # Filter by mask - only add valid samples
+        points_filtered = points_flat[mask_flat]
+        formula_tokens_filtered = formula_tokens_flat[mask_flat]
+        positions_filtered = positions_flat[mask_flat]
+        policy_targets_filtered = policy_targets_flat[mask_flat]
+        value_targets_filtered = value_targets_flat[mask_flat]
 
-    # Filter by mask - only add valid samples
-    points_filtered = points_flat[mask_flat]
-    formula_tokens_filtered = formula_tokens_flat[mask_flat]
-    positions_filtered = positions_flat[mask_flat]
-    policy_targets_filtered = policy_targets_flat[mask_flat]
-    value_targets_filtered = value_targets_flat[mask_flat]
+        # Repeat polish_exprs: each episode's expr repeated for its valid samples
+        polish_exprs_filtered = [polish_exprs[i] for i in range(batch_size) for _ in range(int(jnp.sum(valid_mask[i])))]
 
-    # Add to pool
-    pool.add_samples(
-        points_filtered,
-        formula_tokens_filtered,
-        positions_filtered,
-        policy_targets_filtered,
-        value_targets_filtered,
-    )
+        # Debug: print how many samples from each episode
+        samples_per_episode = jnp.sum(valid_mask, axis=1)
+        print(f"  DEBUG: samples_per_episode = {samples_per_episode}, total = {jnp.sum(samples_per_episode)}")
+
+        # Add to pool
+        self.add_samples(
+            points_filtered,
+            formula_tokens_filtered,
+            polish_exprs_filtered,
+            positions_filtered,
+            policy_targets_filtered,
+            value_targets_filtered,
+        )
 
 
 def loss_per_sample(
@@ -546,19 +556,34 @@ for iteration in range(max_num_iters):
     num_success = jnp.sum(episode_success).item()
     success_rate = num_success / selfplay_batch_size
 
-    # Count successes per length
+    # Count successes, totals, and overshoot per length
     success_counts = np.zeros(len(length_distribution), dtype=int)
-    for i, expr in enumerate(polish_exprs):
-        if episode_success[i]:
-            success_counts[len(expr)] += 1
+    total_counts = np.zeros(len(length_distribution), dtype=int)
+    overshoot_sum = np.zeros(len(length_distribution), dtype=float)
 
-    # Print overall and per-length stats
-    length_stats = " | ".join([f"L{i}:{success_counts[i]}/{int(np.ceil(selfplay_batch_size * length_distribution[i]))}({100*success_counts[i]/max(1,np.ceil(selfplay_batch_size * length_distribution[i])):.0f}%)"
-                               for i in range(1, len(length_distribution)) if length_distribution[i] > 0])
-    print(f"  Episodes: {num_success}/{selfplay_batch_size} ({success_rate:.1%}) | {length_stats}")
+    # Get generated formula lengths from final step
+    formula_tokens = batch_data[1]
+    generated_lengths = jnp.sum(formula_tokens[:, -1, 1:] != 1, axis=1)
+
+    for i, expr in enumerate(polish_exprs):
+        length = len(expr)
+        total_counts[length] += 1
+        if episode_success[i]:
+            success_counts[length] += 1
+            overshoot_sum[length] += int(generated_lengths[i]) - length
+
+    # Print overall and per-length stats with average overshoot
+    stats = []
+    for i in range(1, len(length_distribution)):
+        if total_counts[i] > 0:
+            s = f"L{i}:{success_counts[i]}s/{total_counts[i]-success_counts[i]}f"
+            if success_counts[i] > 0:
+                s += f"(+{overshoot_sum[i]/success_counts[i]:.1f})"
+            stats.append(s)
+    print(f"  Episodes: {num_success}/{selfplay_batch_size} ({success_rate:.1%}) | {' | '.join(stats)}")
 
     # Add samples to pool
-    add_to_pool(points, batch_data, pool)
+    pool.add_from_batch(points, batch_data, polish_exprs)
     print(f"  Pool now has {pool.write_index} total samples added (full={pool.is_full})")
 
     # Training (only if pool is full)
@@ -566,12 +591,12 @@ for iteration in range(max_num_iters):
         print(f"  Skipping training (pool not full yet)\n")
         continue
 
-    # Update curriculum based on pool statistics
-    pool_formula_lengths = np.sum(pool.formula_tokens[:, 1:] != 1, axis=1)
+    # Update curriculum based on pool statistics (using target formula lengths)
+    pool_expr_lengths = np.array([len(expr) for expr in pool.target_polish_exprs])
     pool_total_counts = np.zeros(len(length_distribution), dtype=int)
     pool_success_counts = np.zeros(len(length_distribution), dtype=int)
     for length in range(1, len(length_distribution)):
-        length_mask = (pool_formula_lengths == length)
+        length_mask = (pool_expr_lengths == length)
         pool_total_counts[length] = length_mask.sum()
         pool_success_counts[length] = ((pool.value_targets == 1.0) & length_mask).sum()
 
@@ -605,5 +630,3 @@ for iteration in range(max_num_iters):
 print("=" * 80)
 print("TRAINING COMPLETE")
 print("=" * 80)
-
-
