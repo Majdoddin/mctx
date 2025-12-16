@@ -55,6 +55,7 @@ min_length_proportion = (0.0, 0.25, 0.25, 0.3, 0.2)  # Minimum proportion for ea
 learning_rate = 0.0002  # Matches Boolformer LEARNING_RATE
 training_batch_size = 32  # Minibatch size for training
 pool_size = 200  # Circular buffer size for sample pool
+protect_l4_successes = True  # Protect length-4 success samples from eviction
 
 # Checkpointing
 checkpoint_interval = 1
@@ -212,14 +213,15 @@ class SamplePool:
 
         num_new = len(points)
 
-        # Write samples one by one, skipping protected slots (length-4 successes)
+        # Write samples one by one, skipping protected slots if enabled
         write_idx = self.write_index
         for src_idx in range(num_new):
-            # Skip protected slots: length-4 successes
-            while (self.target_polish_exprs[write_idx] is not None and
-                   len(self.target_polish_exprs[write_idx]) == 4 and
-                   self.value_targets[write_idx] == 1.0):
-                write_idx = (write_idx + 1) % self.pool_size
+            # Skip protected slots: length-4 successes (if protection enabled)
+            if protect_l4_successes:
+                while (self.target_polish_exprs[write_idx] is not None and
+                       len(self.target_polish_exprs[write_idx]) == 4 and
+                       self.value_targets[write_idx] == 1.0):
+                    write_idx = (write_idx + 1) % self.pool_size
 
             # Write sample
             self.points[write_idx] = points[src_idx]
@@ -590,7 +592,7 @@ for iteration in range(max_num_iters):
 
     # Add samples to pool
     pool.add_from_batch(points, batch_data, polish_exprs)
-    print(f"  Pool now has {pool.write_index} total samples added (full={pool.is_full})")
+    print(f"  Pool: {pool.total_written} total written, write_index={pool.write_index}, full={pool.is_full}")
 
     # Training (only if pool is full)
     if not pool.is_full:
