@@ -50,7 +50,7 @@ max_train_formula_length = 4  # Filter out formulas longer than this (None = no 
 length_distribution = [0.0, 0.25, 0.25, 0.3, 0.2]  # Distribution for generating formulas (index 0 unused, 1-4 are lengths). Updated by curriculum.
 training_length_distribution = [0.0, 0.25, 0.25, 0.25, 0.25]  # Distribution for sampling training batches. Updated by curriculum.
 min_success_ratio_per_length = (0.0, 0.25, 0.1, 0.1, 0.1)  # Minimum success ratio for each length in training batch
-min_length_proportion = (0.0, 0.05, 0.05, 0.05, 0.0)  # Minimum proportion for each length when success rate is 1.0 (last is computed)
+min_length_proportion = (0.0, 0.25, 0.25, 0.3, 0.2)  # Minimum proportion for each length when success rate is 1.0 (last is computed)
 # temperature = 1.0  # Not used (gumbel_muzero_policy uses Gumbel sampling, not temperature)
 learning_rate = 0.0002  # Matches Boolformer LEARNING_RATE
 training_batch_size = 32  # Minibatch size for training
@@ -516,13 +516,16 @@ def update_curriculum(success_counts, total_counts):
         if total_counts[length] > 0:
             success_rates[length] = success_counts[length] / total_counts[length]
 
-    # Update generation distribution for lengths 1 to max_len-2
-    for length in range(1, max_len - 1):
+    # Update generation distribution
+    for length in range(1, max_len):
         need = 1.0 - success_rates[length]  # 0.0 if perfect, 1.0 if failing
         new_gen_dist[length] = min_length_proportion[length] + need * 0.3
 
-    # Last length gets remainder
-    new_gen_dist[max_len - 1] = max(0.0, 1.0 - sum(new_gen_dist[1:max_len-1]))
+    # Normalize generation distribution
+    total = sum(new_gen_dist[1:])
+    if total > 0:
+        for length in range(1, max_len):
+            new_gen_dist[length] /= total
 
     # Update training distribution
     for length in range(1, max_len):
@@ -530,7 +533,8 @@ def update_curriculum(success_counts, total_counts):
         if min_success_ratio_per_length[length] > 0 and success_counts[length] == 0:
             new_train_dist[length] = 0.0
         else:
-            new_train_dist[length] = new_gen_dist[length]
+            need = 1.0 - success_rates[length]
+            new_train_dist[length] = min_length_proportion[length] + need * 0.3
 
     # Normalize training distribution
     total_train = sum(new_train_dist[1:])
@@ -602,7 +606,7 @@ for iteration in range(max_num_iters):
         pool_total_counts[length] = length_mask.sum()
         pool_success_counts[length] = ((pool.value_targets == 1.0) & length_mask).sum()
 
-    length_distribution[:], training_length_distribution[:] = update_curriculum(pool_success_counts, pool_total_counts)
+    # length_distribution[:], training_length_distribution[:] = update_curriculum(pool_success_counts, pool_total_counts)
     print(f"  Curriculum: gen={[f'{x:.2f}' for x in length_distribution[1:]]}, train={[f'{x:.2f}' for x in training_length_distribution[1:]]}")
 
     print(f"  Training on batch of {training_batch_size}...")
