@@ -75,7 +75,7 @@ def selfplay_single_episode(
     """
     Generate one episode with MCTS.
 
-    Returns lists of (encoder_output, formula_tokens, position, action_weights, reward) for each step.
+    Returns lists of (encoder_output, formula_tokens, position, action_weights, reward, is_perfect) for each step.
     """
     state = env.reset(rng_key, points, encoder_output)
     max_steps = max_formula_length
@@ -106,15 +106,15 @@ def selfplay_single_episode(
             # DEBUG: Print MCTS output (train.py:112)
             # jax.debug.print("🎯 [MCTS] selected_action={}, action_weights={}", action, action_weights)
 
-            next_state, reward, terminated = env.step(state, action)
+            next_state, reward, terminated, is_perfect = env.step(state, action)
 
-            return next_state, action_weights, reward
+            return next_state, action_weights, reward, is_perfect
 
         def terminated_step():
             # Return dummy values
-            return state, jnp.zeros(vocab_size), jnp.float32(0.0)
+            return state, jnp.zeros(vocab_size), jnp.float32(0.0), jnp.bool_(False)
 
-        next_state, action_weights, reward = jax.lax.cond(
+        next_state, action_weights, reward, is_perfect = jax.lax.cond(
             state.terminated,
             terminated_step,
             active_step
@@ -130,6 +130,7 @@ def selfplay_single_episode(
             state.position,  # scalar - position BEFORE action (where decision was made)
             action_weights,  # (vocab_size,)
             reward,  # scalar
+            is_perfect,  # scalar bool
         )
 
         return next_state, step_data
@@ -183,6 +184,7 @@ def selfplay_episode(
     # batch_data[2]: positions (batch, max_steps)
     # batch_data[3]: action_weights (batch, max_steps, vocab_size)
     # batch_data[4]: rewards (batch, max_steps)
+    # batch_data[5]: is_perfect (batch, max_steps)
     return points, batch_data, polish_exprs
 
 
@@ -300,10 +302,10 @@ class SamplePool:
 
         Args:
             points: (batch, num_points, num_variables)
-            batch_data: tuple of (encoder_outputs, formula_tokens, positions, action_weights, rewards)
+            batch_data: tuple of (encoder_outputs, formula_tokens, positions, action_weights, rewards, is_perfect)
             polish_exprs: list of target polish expressions (one per episode)
         """
-        encoder_outputs, formula_tokens, positions, action_weights, rewards = batch_data
+        encoder_outputs, formula_tokens, positions, action_weights, rewards, is_perfect = batch_data
         batch_size, max_steps = rewards.shape
 
         # Compute value target for each step (final reward, no bootstrapping)
@@ -343,7 +345,7 @@ class SamplePool:
 
         # Debug: print how many samples from each episode
         samples_per_episode = jnp.sum(valid_mask, axis=1)
-        print(f"  DEBUG: samples_per_episode = {samples_per_episode}, total = {jnp.sum(samples_per_episode)}")
+        print(f"  DEBUG: total samples_per_episode = {jnp.sum(samples_per_episode)}")
 
         # Add to pool
         self.add_samples(
@@ -403,15 +405,6 @@ def loss_fn(
     Returns:
         total_loss, (policy_loss_mean, value_loss_mean)
     """
-    # Compute failure scale: num_failures / num_successes
-    num_success = jnp.sum(value_targets == 1.0)
-    num_failure = jnp.sum(value_targets == -1.0)
-    failure_scale = num_failure / (num_success + 1e-8)
-
-    # DEBUG: Print gradient scaling
-    jax.debug.print("⚖️  [loss_fn] num_success={}, num_failure={}, failure_scale={}",
-                    num_success, num_failure, failure_scale)
-
     # Vmap over batch
     batch_loss_fn = jax.vmap(
         lambda p, f, pos, pt, vt: loss_per_sample(model, p, f, pos, pt, vt)
@@ -422,11 +415,9 @@ def loss_fn(
     )
     # policy_losses, value_losses: (batch,)
 
-    # Weighted mean to balance failures vs successes
-    # weights = jnp.where(value_targets == -1.0, failure_scale, 1.0)  # (batch,)
-    weights = jnp.ones_like(value_targets)  # Uncomment to disable failure scaling
-    policy_loss_mean = jnp.sum(policy_losses * weights) / jnp.sum(weights)
-    value_loss_mean = jnp.sum(value_losses * weights) / jnp.sum(weights)
+    # Uniform weighting for continuous rewards
+    policy_loss_mean = jnp.mean(policy_losses)
+    value_loss_mean = jnp.mean(value_losses)
 
     total_loss = policy_loss_mean + value_loss_mean
 
@@ -558,37 +549,79 @@ for iteration in range(max_num_iters):
     rng_key, subkey = jax.random.split(rng_key)
     points, batch_data, polish_exprs = selfplay_episode(model, env, root_fn, recurrent_fn, subkey)
 
-    # Track episode success
-    rewards = batch_data[4]
-    episode_success = jnp.any(rewards == 1.0, axis=1)  # (batch,)
+    # Track episode success using is_perfect flag
+    rewards = batch_data[4]  # balanced accuracy values
+    is_perfect = batch_data[5]  # perfect match flags
+    episode_success = jnp.any(is_perfect, axis=1)  # (batch,) - any step was perfect
     num_success = jnp.sum(episode_success).item()
     success_rate = num_success / selfplay_batch_size
 
-    # Count successes, totals, and overshoot per length
+    # Count successes, totals, overshoot, and mean accuracy per length
     success_counts = np.zeros(len(length_distribution), dtype=int)
     total_counts = np.zeros(len(length_distribution), dtype=int)
     overshoot_sum = np.zeros(len(length_distribution), dtype=float)
+    accuracy_sum = np.zeros(len(length_distribution), dtype=float)
 
-    # Get generated formula lengths from final step
+    # Get generated formula lengths from final step and max rewards per episode
     formula_tokens = batch_data[1]
     generated_lengths = jnp.sum(formula_tokens[:, -1, 1:] != 1, axis=1)
+    max_rewards = jnp.max(rewards, axis=1)  # Best accuracy achieved in episode
 
     for i, expr in enumerate(polish_exprs):
         length = len(expr)
         total_counts[length] += 1
+        accuracy_sum[length] += float(max_rewards[i])
         if episode_success[i]:
             success_counts[length] += 1
             overshoot_sum[length] += int(generated_lengths[i]) - length
 
-    # Print overall and per-length stats with average overshoot
+    # Print overall and per-length stats with success/fail, mean accuracy, and overshoot
     stats = []
     for i in range(1, len(length_distribution)):
         if total_counts[i] > 0:
+            mean_acc = accuracy_sum[i] / total_counts[i]
             s = f"L{i}:{success_counts[i]}s/{total_counts[i]-success_counts[i]}f"
+            s += f"(acc={mean_acc:.2f}"
             if success_counts[i] > 0:
-                s += f"(+{overshoot_sum[i]/success_counts[i]:.1f})"
+                s += f",+{overshoot_sum[i]/success_counts[i]:.1f}"
+            s += ")"
             stats.append(s)
     print(f"  Episodes: {num_success}/{selfplay_batch_size} ({success_rate:.1%}) | {' | '.join(stats)}")
+
+    # Check value prediction accuracy
+    encoder_outputs = batch_data[0]  # (batch, max_steps, num_points, n_embd)
+    formula_tokens_batch = batch_data[1]  # (batch, max_steps, max_len)
+    positions_batch = batch_data[2]  # (batch, max_steps)
+    actual_rewards = batch_data[4]  # (batch, max_steps)
+
+    # Get value predictions for all steps in all episodes
+    # Flatten batch to (batch*max_steps, ...)
+    batch_size, max_steps = actual_rewards.shape
+    flat_encoder = encoder_outputs.reshape(-1, encoder_outputs.shape[2], encoder_outputs.shape[3])
+    flat_tokens = formula_tokens_batch.reshape(-1, formula_tokens_batch.shape[2])
+    flat_positions = positions_batch.reshape(-1)
+    flat_rewards = actual_rewards.reshape(-1)
+
+    # Get predictions
+    _, values = model.decode_formula(flat_tokens, flat_encoder, decode=False)
+
+    # Value at SOS (position 0, which is position 1 in 1-indexed)
+    # Reshape back to (batch, max_steps) to get first step per episode
+    values_reshaped = values.reshape(batch_size, max_steps, -1)
+    value_sos = values_reshaped[:, 0, 0]  # (batch,) - value at position 0 (SOS) for each episode
+    mean_value_sos = jnp.mean(value_sos)
+
+    # Value at final positions (completed formulas)
+    batch_indices = jnp.arange(len(flat_positions))
+    value_preds = values[batch_indices, flat_positions - 1]
+
+    # Compute MAE for completed formulas (non-zero rewards)
+    mask = flat_rewards > 0.0
+    if jnp.sum(mask) > 0:
+        value_mae_final = jnp.mean(jnp.abs(value_preds[mask] - flat_rewards[mask]))
+        print(f"  Value: SOS={mean_value_sos:.3f}, Final MAE={value_mae_final:.4f}")
+    else:
+        print(f"  Value: SOS={mean_value_sos:.3f}")
 
     # Add samples to pool
     pool.add_from_batch(points, batch_data, polish_exprs)

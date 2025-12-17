@@ -132,8 +132,8 @@ def create_recurrent_fn(model: BoolformerTransformer, env: BoolformerEnv):
         # Action is also batched, extract single action
         single_action = action[0] if action.ndim > 0 else action
 
-        # Environment step
-        next_state, reward, terminated = env.step(state, single_action)
+        # Environment step (ignore is_perfect, only used for logging in selfplay)
+        next_state, reward, terminated, _ = env.step(state, single_action)
 
         # Discount: 0 if terminated, 1 otherwise
         discount = jnp.where(terminated, jnp.float32(0.0), jnp.float32(1.0))

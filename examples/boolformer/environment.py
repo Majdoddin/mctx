@@ -220,6 +220,60 @@ def evaluate_formula_on_points(
     return jnp.logical_and(minority_correct, count_correct)
 
 
+def evaluate_formula_balanced_accuracy(
+    tokens: jax.Array,
+    position: jax.Array,
+    points: jax.Array,
+    config: BoolformerConfig
+) -> Tuple[jax.Array, jax.Array]:
+    """Evaluate formula using balanced accuracy reward.
+
+    Returns:
+        balanced_accuracy: 0.5 * (minority_correct/num_minority) + 0.5 * (majority_correct/num_majority)
+        is_perfect: Boolean, True if formula is perfectly correct (for curriculum)
+    """
+    # Evaluate formula on all 2^num_variables combinations
+    num_rows = 2 ** config.num_variables
+    def eval_row(row_idx):
+        variable_values = jnp.array([(row_idx >> bit) & 1 for bit in range(config.num_variables)], dtype=jnp.bool_)
+        return evaluate_polish_formula(tokens, position, variable_values, config)
+
+    all_outputs = jax.vmap(eval_row)(jnp.arange(num_rows))
+
+    # Build truth table: minority points should output True, majority should output False
+    truth_table = jnp.zeros(num_rows, dtype=jnp.bool_)
+
+    # Vectorized: convert all minority points to row indices
+    def point_to_row_idx(point):
+        is_padding = jnp.all(point == 0)
+        point_binary = ((point + 1) / 2).astype(jnp.int32)
+        row_idx = jnp.sum(point_binary * (2 ** jnp.arange(config.num_variables)))
+        return jnp.where(is_padding, -1, row_idx)  # -1 for padding points
+
+    row_indices = jax.vmap(point_to_row_idx)(points)
+
+    # Mark all valid (non-padding) minority points as True
+    def mark_point(truth_table, idx):
+        return jnp.where(idx >= 0, truth_table.at[idx].set(True), truth_table)
+
+    truth_table, _ = jax.lax.scan(lambda tt, idx: (mark_point(tt, idx), None), truth_table, row_indices)
+
+    # Compute balanced accuracy
+    num_minority = jnp.sum(truth_table)
+    num_majority = num_rows - num_minority
+
+    minority_correct = jnp.sum(all_outputs & truth_table)  # True positives
+    majority_correct = jnp.sum(~all_outputs & ~truth_table)  # True negatives
+
+    minority_accuracy = minority_correct / jnp.maximum(num_minority, 1.0)
+    majority_accuracy = majority_correct / jnp.maximum(num_majority, 1.0)
+
+    balanced_accuracy = 0.5 * minority_accuracy + 0.5 * majority_accuracy
+    is_perfect = (minority_correct == num_minority) & (majority_correct == num_majority)
+
+    return balanced_accuracy, is_perfect
+
+
 def get_allowed_tokens(
     tokens: jax.Array,
     position: jax.Array,
@@ -370,7 +424,7 @@ class BoolformerEnv:
         self,
         state: BoolformerState,
         action: jax.Array
-    ) -> Tuple[BoolformerState, jax.Array, jax.Array]:
+    ) -> Tuple[BoolformerState, jax.Array, jax.Array, jax.Array]:
         """
         Take a step by adding a token to the formula.
 
@@ -379,7 +433,7 @@ class BoolformerEnv:
             action: Token to add (scalar in [0, vocab_size))
 
         Returns:
-            (next_state, reward, terminated)
+            (next_state, reward, terminated, is_perfect)
         """
         # If already terminated, return state unchanged
         # (JAX will trace both branches, but this handles batched states correctly)
@@ -392,13 +446,12 @@ class BoolformerEnv:
         terminated, legal_action_mask = get_allowed_tokens(formula_tokens, position, self.config)
 
         # Compute reward only when terminated (formula syntactically complete)
-        def eval_complete_formula():
-            correct = evaluate_formula_on_points(formula_tokens, position, state.points, self.config)
-            return jnp.where(correct,
-                           jnp.float32(self.config.correct_reward),
-                           jnp.float32(self.config.incorrect_reward))
-
-        reward = jax.lax.cond(terminated, eval_complete_formula, lambda: jnp.float32(self.config.step_penalty))
+        # Use balanced accuracy [0.0, 1.0] as reward, also return is_perfect for logging
+        reward, is_perfect = jax.lax.cond(
+            terminated,
+            lambda: evaluate_formula_balanced_accuracy(formula_tokens, position, state.points, self.config),
+            lambda: (jnp.float32(0.0), jnp.bool_(False))
+        )
 
         next_state = state._replace(
             formula_tokens=formula_tokens,
@@ -408,16 +461,10 @@ class BoolformerEnv:
         )
 
         # If state was already terminated, return unchanged
-        def terminated_branch():
-            return state, jnp.float32(0.0), jnp.bool_(True)
-
-        def active_branch():
-            return next_state, reward, terminated
-
         return jax.lax.cond(
             state.terminated,
-            terminated_branch,
-            active_branch
+            lambda: (state, jnp.float32(0.0), jnp.bool_(True), jnp.bool_(False)),
+            lambda: (next_state, reward, terminated, is_perfect)
         )
 
     def get_legal_actions(self, state: BoolformerState) -> jax.Array:

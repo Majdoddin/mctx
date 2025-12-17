@@ -282,7 +282,7 @@ class BoolformerTransformer(nnx.Module):
         Returns:
             (policy_logits, value):
                 - policy_logits: (batch, seq_len, vocab_size) next token logits
-                - value: (batch,) success estimate in [-1, 1]
+                - value: (batch, seq_len) success estimate in [0, 1]
         """
         B, T = formula_tokens.shape
 
@@ -301,17 +301,14 @@ class BoolformerTransformer(nnx.Module):
         for block in self.decoder_blocks:
             x = block(x, cos_sin=cos_sin, context=encoder_output, mask=causal_mask, decode=decode)
 
-        # Policy head: predict next token for each position
+        # TODO: Optimize - computing policy/value heads for all positions but only using one per sample
+        #       Could extract x[batch_indices, positions-1] first. Also consider relu^2 activation.
         policy_logits = self.policy_head(x)  # (batch, seq_len, vocab_size)
 
-        # Value head: predict value for each position using same embedding as policy
-        # TODO: Wasteful during MCTS - should only compute for current position
-        # TODO: Consider relu^2 activation like nanochat instead of GELU
-        # For now, compute for all positions and extract the needed one later
         value = self.value_fc1(x)  # (batch, seq_len, n_embd) - Linear applies to last dim
         value = jax.nn.gelu(value)
         value = self.value_fc2(value)  # (batch, seq_len, 1)
-        value = jnp.tanh(value).squeeze(-1)  # (batch, seq_len) in range [-1, 1]
+        value = jax.nn.sigmoid(value).squeeze(-1)  # (batch, seq_len) in range [0, 1]
 
         return policy_logits, value
 
