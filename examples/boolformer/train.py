@@ -556,32 +556,32 @@ for iteration in range(max_num_iters):
     num_success = jnp.sum(episode_success).item()
     success_rate = num_success / selfplay_batch_size
 
-    # Count successes, totals, overshoot, and mean accuracy per length
+    # Count successes, totals, overshoot, and mean IoU per length
     success_counts = np.zeros(len(length_distribution), dtype=int)
     total_counts = np.zeros(len(length_distribution), dtype=int)
     overshoot_sum = np.zeros(len(length_distribution), dtype=float)
-    accuracy_sum = np.zeros(len(length_distribution), dtype=float)
+    iou_sum = np.zeros(len(length_distribution), dtype=float)
 
     # Get generated formula lengths from final step and max rewards per episode
     formula_tokens = batch_data[1]
     generated_lengths = jnp.sum(formula_tokens[:, -1, 1:] != 1, axis=1)
-    max_rewards = jnp.max(rewards, axis=1)  # Best accuracy achieved in episode
+    max_rewards = jnp.max(rewards, axis=1)  # Best mIoU achieved in episode
 
     for i, expr in enumerate(polish_exprs):
         length = len(expr)
         total_counts[length] += 1
-        accuracy_sum[length] += float(max_rewards[i])
+        iou_sum[length] += float(max_rewards[i])
         if episode_success[i]:
             success_counts[length] += 1
             overshoot_sum[length] += int(generated_lengths[i]) - length
 
-    # Print overall and per-length stats with success/fail, mean accuracy, and overshoot
+    # Print overall and per-length stats with success/fail, mean IoU, and overshoot
     stats = []
     for i in range(1, len(length_distribution)):
         if total_counts[i] > 0:
-            mean_acc = accuracy_sum[i] / total_counts[i]
+            mean_iou = iou_sum[i] / total_counts[i]
             s = f"L{i}:{success_counts[i]}s/{total_counts[i]-success_counts[i]}f"
-            s += f"(acc={mean_acc:.2f}"
+            s += f"(iou={mean_iou:.2f}"
             if success_counts[i] > 0:
                 s += f",+{overshoot_sum[i]/success_counts[i]:.1f}"
             s += ")"

@@ -226,10 +226,10 @@ def evaluate_formula_balanced_accuracy(
     points: jax.Array,
     config: BoolformerConfig
 ) -> Tuple[jax.Array, jax.Array]:
-    """Evaluate formula using balanced accuracy reward.
+    """Evaluate formula using mean IoU (Jaccard Index) reward.
 
     Returns:
-        balanced_accuracy: 0.5 * (minority_correct/num_minority) + 0.5 * (majority_correct/num_majority)
+        miou: Mean IoU = 0.5 * IoU_ones + 0.5 * IoU_zeros, where IoU = |A∩B| / |A∪B|
         is_perfect: Boolean, True if formula is perfectly correct (for curriculum)
     """
     # Evaluate formula on all 2^num_variables combinations
@@ -258,20 +258,32 @@ def evaluate_formula_balanced_accuracy(
 
     truth_table, _ = jax.lax.scan(lambda tt, idx: (mark_point(tt, idx), None), truth_table, row_indices)
 
-    # Compute balanced accuracy
-    num_minority = jnp.sum(truth_table)
-    num_majority = num_rows - num_minority
+    # Compute mean IoU (Jaccard Index) reward
+    # Truth table counts
+    num_truth_ones = jnp.sum(truth_table)
+    num_truth_zeros = num_rows - num_truth_ones
 
-    minority_correct = jnp.sum(all_outputs & truth_table)  # True positives
-    majority_correct = jnp.sum(~all_outputs & ~truth_table)  # True negatives
+    # Predicted counts
+    num_pred_ones = jnp.sum(all_outputs)
+    num_pred_zeros = num_rows - num_pred_ones
 
-    minority_accuracy = minority_correct / jnp.maximum(num_minority, 1.0)
-    majority_accuracy = majority_correct / jnp.maximum(num_majority, 1.0)
+    # Correct predictions
+    correct_ones = jnp.sum(all_outputs & truth_table)  # True positives (intersection)
+    correct_zeros = jnp.sum(~all_outputs & ~truth_table)  # True negatives (intersection)
 
-    balanced_accuracy = 0.5 * minority_accuracy + 0.5 * majority_accuracy
-    is_perfect = (minority_correct == num_minority) & (majority_correct == num_majority)
+    # IoU for ones: |A ∩ B| / |A ∪ B|
+    union_ones = num_truth_ones + num_pred_ones - correct_ones
+    iou_ones = correct_ones / jnp.maximum(union_ones, 1.0)
 
-    return balanced_accuracy, is_perfect
+    # IoU for zeros: |A ∩ B| / |A ∪ B|
+    union_zeros = num_truth_zeros + num_pred_zeros - correct_zeros
+    iou_zeros = correct_zeros / jnp.maximum(union_zeros, 1.0)
+
+    # Mean IoU: average of ones and zeros
+    miou = 0.5 * iou_ones + 0.5 * iou_zeros
+    is_perfect = (correct_ones == num_truth_ones) & (correct_zeros == num_truth_zeros)
+
+    return miou, is_perfect
 
 
 def get_allowed_tokens(
