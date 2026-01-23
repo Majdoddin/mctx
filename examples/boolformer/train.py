@@ -36,8 +36,8 @@ max_formula_length = 4 + 1 #+1 for SOS
 # n_decoder_layers = 8  # NUM_DECODER_LAYERS
 
 # CPU/test config:
-n_embd=64
-n_head=8
+n_embd=16
+n_head=2
 n_encoder_layers=1
 n_decoder_layers=1
 
@@ -45,17 +45,17 @@ n_decoder_layers=1
 seed = 0
 max_num_iters = 20
 selfplay_batch_size = 20#128  # Formulas per iteration
-num_simulations = 3#8  # MCTS simulations per action
+num_simulations = 8  # MCTS simulations per action
 max_train_formula_length = 4  # Filter out formulas longer than this (None = no filter)
-length_distribution = [0.0, 0.25, 0.25, 0.3, 0.2]  # Distribution for generating formulas (index 0 unused, 1-4 are lengths). Updated by curriculum.
-training_length_distribution = [0.0, 0.25, 0.25, 0.25, 0.25]  # Distribution for sampling training batches. Updated by curriculum.
-min_success_ratio_per_length = (0.0, 0.25, 0.1, 0.1, 0.1)  # Minimum success ratio for each length in training batch
+length_distribution = [0.0, 0.0, 0.0, 0.0, 1]  # Distribution for generating formulas (index 0 unused, 1-4 are lengths). Updated by curriculum.
+training_length_distribution = [0.0, 0.0, 0.0, 0.0, 1]  # Distribution for sampling training batches. Updated by curriculum.
+min_success_ratio_per_length = [0.0, 0.0, 0.0, 0.0, 0.5]  # Minimum success ratio for each length in training batch
 min_length_proportion = (0.0, 0.25, 0.25, 0.3, 0.2)  # Minimum proportion for each length when success rate is 1.0 (last is computed)
 # temperature = 1.0  # Not used (gumbel_muzero_policy uses Gumbel sampling, not temperature)
 learning_rate = 0.0002  # Matches Boolformer LEARNING_RATE
-training_batch_size = 32  # Minibatch size for training
-pool_size = 200  # Circular buffer size for sample pool
-protect_l4_successes = True  # Protect length-4 success samples from eviction
+training_batch_size = 10  # Minibatch size for training
+pool_size = 300  # Circular buffer size for sample pool
+protect_l4_successes = False # Protect length-4 success samples from eviction
 
 # Checkpointing
 checkpoint_interval = 1

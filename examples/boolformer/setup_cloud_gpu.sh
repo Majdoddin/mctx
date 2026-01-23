@@ -35,11 +35,11 @@ SSH_OPTS="-S $SSH_SOCKET"
 echo -e "\n[2/8] Testing connection..."
 ssh $SSH_OPTS $SSH_HOST "echo 'SSH connection successful'"
 
-# Install system dependencies
+# Install system dependencies including Python 3.11
 echo -e "\n[3/8] Installing system dependencies..."
 ssh $SSH_OPTS $SSH_HOST << 'EOF'
-sudo apt-get update
-sudo apt-get install -y git python3-pip python3-venv
+apt-get update
+apt-get install -y git python3.11 python3.11-venv python3.11-dev
 EOF
 
 # Clone repositories
@@ -48,39 +48,17 @@ ssh $SSH_OPTS $SSH_HOST << 'EOF'
 cd ~
 
 # Clone Boolformer
-if [ ! -d "Boolformer" ]; then
-    git clone https://github.com/arthurenard/Boolformer.git
-    echo "✓ Cloned Boolformer"
-else
-    echo "✓ Boolformer already exists"
-fi
+git clone https://github.com/arthurenard/Boolformer.git
+echo "✓ Cloned Boolformer"
 
 # Clone mctx inside Boolformer (matches local structure)
 cd ~/Boolformer
-if [ ! -d "mctx" ]; then
-    git clone -b boolformer-example https://github.com/Majdoddin/mctx.git
-    echo "✓ Cloned mctx (boolformer-example branch)"
-else
-    cd mctx
-    git fetch origin
-    git checkout boolformer-example
-    git pull
-    echo "✓ Updated mctx (boolformer-example branch)"
-    cd ..
-fi
+git clone -b boolformer-example https://github.com/Majdoddin/mctx.git
+echo "✓ Cloned mctx (boolformer-example branch)"
 
 # Clone flax inside Boolformer (matches local structure)
-if [ ! -d "flax" ]; then
-    git clone -b rope-rmsnorm https://github.com/Majdoddin/flax.git
-    echo "✓ Cloned flax (rope-rmsnorm branch)"
-else
-    cd flax
-    git fetch origin
-    git checkout rope-rmsnorm
-    git pull
-    echo "✓ Updated flax (rope-rmsnorm branch)"
-    cd ..
-fi
+git clone -b rope-rmsnorm https://github.com/Majdoddin/flax.git
+echo "✓ Cloned flax (rope-rmsnorm branch)"
 EOF
 
 # Create virtual environment and install dependencies
@@ -88,12 +66,8 @@ echo -e "\n[5/8] Creating virtual environment..."
 ssh $SSH_OPTS $SSH_HOST << 'EOF'
 cd ~/Boolformer
 
-if [ ! -d ".venv" ]; then
-    python3 -m venv .venv
-    echo "✓ Created .venv"
-else
-    echo "✓ .venv already exists"
-fi
+python3.11 -m venv .venv
+echo "✓ Created .venv with Python 3.11"
 
 source .venv/bin/activate
 
