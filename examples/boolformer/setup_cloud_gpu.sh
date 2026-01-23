@@ -72,7 +72,7 @@ echo "✓ Created .venv with Python 3.11"
 source .venv/bin/activate
 
 # Upgrade pip
-pip install --upgrade pip
+pip install --no-cache-dir --upgrade pip
 
 echo "✓ Virtual environment ready"
 EOF
@@ -84,7 +84,7 @@ cd ~/Boolformer
 source .venv/bin/activate
 
 # Install JAX with CUDA 12 support (compatible with CUDA 13.0)
-pip install -U "jax[cuda12]"
+pip install --no-cache-dir -U "jax[cuda12]"
 
 echo "✓ JAX with CUDA installed"
 EOF
@@ -97,16 +97,16 @@ source .venv/bin/activate
 
 # Install custom flax
 cd flax
-pip install -e .
+pip install --no-cache-dir -e .
 cd ..
 
 # Install mctx
 cd mctx
-pip install -e .
+pip install --no-cache-dir -e .
 cd ..
 
 # Install Boolformer dependencies
-pip install -r requirements.txt
+pip install --no-cache-dir -r requirements.txt
 
 echo "✓ All Python packages installed"
 EOF
