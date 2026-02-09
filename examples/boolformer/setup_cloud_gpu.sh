@@ -2,26 +2,41 @@
 # Setup script for cloud GPU training environment
 # Usage: ./setup_cloud_gpu.sh <ssh_host> [ssh_port]
 #
-# Example: ./setup_cloud_gpu.sh user@gpu.example.com 22
+# If ssh_port is omitted, uses port from ~/.ssh/config
+# Examples:
+#   ./setup_cloud_gpu.sh Vast-Ruhollah              # uses config
+#   ./setup_cloud_gpu.sh user@gpu.example.com 22    # explicit port
 
 set -e  # Exit on error
 
 if [ $# -lt 1 ]; then
     echo "Usage: $0 <ssh_host> [ssh_port]"
-    echo "Example: $0 user@gpu.example.com 22"
+    echo "Examples:"
+    echo "  $0 Vast-Ruhollah              # uses ~/.ssh/config"
+    echo "  $0 user@gpu.example.com 22    # explicit port"
     exit 1
 fi
 
 SSH_HOST=$1
-SSH_PORT=${2:-22}
 SSH_SOCKET="/tmp/ssh-cloud-gpu-$$"
-SSH_OPTS="-p $SSH_PORT"
 
-echo "========================================="
-echo "Setting up Boolformer MCTS on cloud GPU"
-echo "Host: $SSH_HOST"
-echo "Port: $SSH_PORT"
-echo "========================================="
+# If port is explicitly provided, use it. Otherwise rely on SSH config.
+if [ $# -ge 2 ]; then
+    SSH_PORT=$2
+    SSH_OPTS="-p $SSH_PORT"
+    echo "========================================="
+    echo "Setting up Boolformer MCTS on cloud GPU"
+    echo "Host: $SSH_HOST"
+    echo "Port: $SSH_PORT"
+    echo "========================================="
+else
+    SSH_OPTS=""
+    echo "========================================="
+    echo "Setting up Boolformer MCTS on cloud GPU"
+    echo "Host: $SSH_HOST"
+    echo "Port: (from SSH config)"
+    echo "========================================="
+fi
 
 # Establish persistent SSH connection
 echo -e "\n[1/8] Establishing persistent SSH connection..."
@@ -35,11 +50,11 @@ SSH_OPTS="-S $SSH_SOCKET"
 echo -e "\n[2/8] Testing connection..."
 ssh $SSH_OPTS $SSH_HOST "echo 'SSH connection successful'"
 
-# Install system dependencies including Python 3.11
+# Install system dependencies
 echo -e "\n[3/8] Installing system dependencies..."
 ssh $SSH_OPTS $SSH_HOST << 'EOF'
 apt-get update
-apt-get install -y git python3.11 python3.11-venv python3.11-dev
+apt-get install -y git python3 python3-venv python3-pip
 EOF
 
 # Clone repositories
@@ -66,8 +81,8 @@ echo -e "\n[5/8] Creating virtual environment..."
 ssh $SSH_OPTS $SSH_HOST << 'EOF'
 cd ~/Boolformer
 
-python3.11 -m venv .venv
-echo "✓ Created .venv with Python 3.11"
+python3 -m venv .venv
+echo "✓ Created .venv"
 
 source .venv/bin/activate
 
@@ -127,6 +142,11 @@ pip list | grep -E "(jax|flax|mctx|numpy|optax)"
 echo ""
 echo "✓ Installation verification complete"
 EOF
+
+# Disable auto-tmux for future logins
+echo -e "\nDisabling auto-tmux..."
+ssh $SSH_OPTS $SSH_HOST "touch ~/.no_auto_tmux"
+echo "✓ Auto-tmux disabled"
 
 # Close persistent SSH connection
 echo -e "\nClosing persistent SSH connection..."

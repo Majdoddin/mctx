@@ -29,50 +29,56 @@ num_variables = 2
 vocab_size = 5 + num_variables
 max_formula_length = 4 + 1 #+1 for SOS
 
-# GPU config
+# GPU config: RTX 3090(Ti) 24GB
 # Model architecture (matches Boolformer config/transformer/noiseless.py: 59M params)
-# n_embd = 512  # D_MODEL (feedforward dim = 4 * n_embd = 2048 automatically)
-# n_head = 16  # NUM_HEADS
-# n_encoder_layers = 8  # NUM_ENCODER_LAYERS
-# n_decoder_layers = 8  # NUM_DECODER_LAYERS
-
-# Training
-# seed = 0
-# max_num_iters = 20
-# selfplay_batch_size = 128  # Formulas per iteration
-# num_simulations = 8  # MCTS simulations per action
-# max_train_formula_length = 4  # Filter out formulas longer than this (None = no filter)
-# length_distribution = [0.0, 0.25, 0.25, 0.3, 0.2]  # Distribution for generating formulas (index 0 unused, 1-4 are lengths). Updated by curriculum.
-# training_length_distribution = [0.0, 0.25, 0.25, 0.25, 0.25]  # Distribution for sampling training batches. Updated by curriculum.
-# min_success_ratio_per_length = (0.0, 0.25, 0.1, 0.1, 0.1)  # Minimum success ratio for each length in training batch
-# min_length_proportion = (0.0, 0.25, 0.25, 0.3, 0.2)  # Minimum proportion for each length when success rate is 1.0 (last is computed)
-# # temperature = 1.0  # Not used (gumbel_muzero_policy uses Gumbel sampling, not temperature)
-# learning_rate = 0.0002  # Matches Boolformer LEARNING_RATE
-# training_batch_size = 32  # Minibatch size for training
-# pool_size = 600  # Circular buffer size for sample pool
-# protect_l4_successes = True  # Protect length-4 success samples from eviction
-
-# CPU/test config:
-n_embd=16
-n_head=2
-n_encoder_layers=1
-n_decoder_layers=1
+n_embd = 512           # D_MODEL (feedforward dim = 4 * n_embd = 2048 automatically)
+n_head = 16            # NUM_HEADS
+n_encoder_layers = 8   # NUM_ENCODER_LAYERS
+n_decoder_layers = 8   # NUM_DECODER_LAYERS
 
 # Training
 seed = 0
-max_num_iters = 20
-selfplay_batch_size = 20#128  # Formulas per iteration
-num_simulations = 3 #8  # MCTS simulations per action
-max_train_formula_length = 4  # Filter out formulas longer than this (None = no filter)
-length_distribution = [0.0, 0.0, 0.0, 0.0, 1]  # Distribution for generating formulas (index 0 unused, 1-4 are lengths). Updated by curriculum.
-training_length_distribution = [0.0, 0.0, 0.0, 0.0, 1]  # Distribution for sampling training batches. Updated by curriculum.
-min_success_ratio_per_length = [0.0, 0.0, 0.0, 0.0, 0.5]  # Minimum success ratio for each length in training batch
-min_length_proportion = (0.0, 0.25, 0.25, 0.3, 0.2)  # Minimum proportion for each length when success rate is 1.0 (last is computed)
-# temperature = 1.0  # Not used (gumbel_muzero_policy uses Gumbel sampling, not temperature)
-learning_rate = 0.0002  # Matches Boolformer LEARNING_RATE
-training_batch_size = 10  # Minibatch size for training
-pool_size = 300  # Circular buffer size for sample pool
-protect_l4_successes = False # Protect length-4 success samples from eviction
+max_num_iters = 1000   # Production run
+
+# Self-play: ~64 formulas × 2.5 samples/formula = ~160 samples/iter
+selfplay_batch_size = 64   # Parallel episodes (conservative for 60M model + 24GB)
+num_simulations = 8        # MCTS simulations per action
+
+# L4-only training
+max_train_formula_length = 4
+length_distribution = [0.0, 0.0, 0.0, 0.0, 1]          # 100% L4 generation
+training_length_distribution = [0.0, 0.0, 0.0, 0.0, 1]  # 100% L4 training
+min_success_ratio_per_length = [0.0, 0.0, 0.0, 0.0, 0.5]  # ≥50% successes in batch
+min_length_proportion = (0.0, 0.0, 0.0, 0.0, 1.0)  # L4-only (for curriculum if enabled)
+
+# Training: 160 samples / 32 batch = 5 steps/iter → replay ratio 1.0
+learning_rate = 0.0002
+training_batch_size = 32       # Minibatch size (conservative for 60M model)
+training_steps_per_iter = 5    # Multiple gradient updates (like pgx AlphaZero)
+pool_size = 1600               # ~10 iterations (160 × 10)
+protect_l4_successes = True    # Protect rare successes from eviction
+
+# # CPU/test config:
+# n_embd=16
+# n_head=2
+# n_encoder_layers=1
+# n_decoder_layers=1
+
+# # Training
+# seed = 0
+# max_num_iters = 20
+# selfplay_batch_size = 20#128  # Formulas per iteration
+# num_simulations = 3 #8  # MCTS simulations per action
+# max_train_formula_length = 4  # Filter out formulas longer than this (None = no filter)
+# length_distribution = [0.0, 0.0, 0.0, 0.0, 1]  # Distribution for generating formulas (index 0 unused, 1-4 are lengths). Updated by curriculum.
+# training_length_distribution = [0.0, 0.0, 0.0, 0.0, 1]  # Distribution for sampling training batches. Updated by curriculum.
+# min_success_ratio_per_length = [0.0, 0.0, 0.0, 0.0, 0.5]  # Minimum success ratio for each length in training batch
+# min_length_proportion = (0.0, 0.25, 0.25, 0.3, 0.2)  # Minimum proportion for each length when success rate is 1.0 (last is computed)
+# # temperature = 1.0  # Not used (gumbel_muzero_policy uses Gumbel sampling, not temperature)
+# learning_rate = 0.0002  # Matches Boolformer LEARNING_RATE
+# training_batch_size = 10  # Minibatch size for training
+# pool_size = 300  # Circular buffer size for sample pool
+# protect_l4_successes = False # Protect length-4 success samples from eviction
 
 # Checkpointing
 checkpoint_interval = 1
@@ -661,17 +667,28 @@ for iteration in range(max_num_iters):
     # length_distribution[:], training_length_distribution[:] = update_curriculum(pool_success_counts, pool_total_counts)
     print(f"  Curriculum: gen={[f'{x:.2f}' for x in length_distribution[1:]]}, train={[f'{x:.2f}' for x in training_length_distribution[1:]]}")
 
-    print(f"  Training on batch of {training_batch_size}...")
-    rng_key, subkey = jax.random.split(rng_key)
+    # Multiple training steps per iteration (like pgx AlphaZero)
+    print(f"  Training: {training_steps_per_iter} steps × {training_batch_size} batch...")
     grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
-    (loss, (policy_loss, value_loss)), grads = grad_fn(
-        model, *pool.sample_batch(training_batch_size, subkey, training_length_distribution, min_success_ratio_per_length)
-    )
-    optimizer.update(model, grads)
+    policy_losses, value_losses = [], []
+
+    for step in range(training_steps_per_iter):
+        rng_key, subkey = jax.random.split(rng_key)
+        (loss, (policy_loss, value_loss)), grads = grad_fn(
+            model, *pool.sample_batch(training_batch_size, subkey, training_length_distribution, min_success_ratio_per_length)
+        )
+        optimizer.update(model, grads)
+        policy_losses.append(policy_loss)
+        value_losses.append(value_loss)
+
+    # Average losses across training steps
+    avg_policy_loss = sum(policy_losses) / len(policy_losses)
+    avg_value_loss = sum(value_losses) / len(value_losses)
+    avg_loss = avg_policy_loss + avg_value_loss
 
     iter_time = time.time() - iter_start
 
-    print(f"  Loss: {loss:.4f} (policy={policy_loss:.4f}, value={value_loss:.4f})")
+    print(f"  Loss: {avg_loss:.4f} (policy={avg_policy_loss:.4f}, value={avg_value_loss:.4f})")
     print(f"  Time: {iter_time:.2f}s\n")
 
     # Checkpoint
