@@ -29,6 +29,30 @@ num_variables = 2
 vocab_size = 5 + num_variables
 max_formula_length = 4 + 1 #+1 for SOS
 
+# # CPU/test config: minimal settings for functionality testing
+# n_embd = 16
+# n_head = 2
+# n_encoder_layers = 1
+# n_decoder_layers = 1
+
+# seed = 0
+# max_num_iters = 5
+
+# selfplay_batch_size = 4
+# num_simulations = 2
+
+# max_train_formula_length = 4
+# length_distribution = [0.0, 0.0, 0.0, 0.0, 1]
+# training_length_distribution = [0.0, 0.0, 0.0, 0.0, 1]
+# min_success_ratio_per_length = [0.0, 0.0, 0.0, 0.0, 0.5]
+# min_length_proportion = (0.0, 0.0, 0.0, 0.0, 1.0)
+
+# learning_rate = 0.0002
+# training_batch_size = 4
+# training_steps_per_iter = 1
+# pool_size = 20
+# protect_l4_successes = False
+
 # GPU config: RTX 3090(Ti) 24GB
 # Model architecture (matches Boolformer config/transformer/noiseless.py: 59M params)
 n_embd = 512           # D_MODEL (feedforward dim = 4 * n_embd = 2048 automatically)
@@ -36,49 +60,25 @@ n_head = 16            # NUM_HEADS
 n_encoder_layers = 8   # NUM_ENCODER_LAYERS
 n_decoder_layers = 8   # NUM_DECODER_LAYERS
 
-# Training
 seed = 0
-max_num_iters = 1000   # Production run
+max_num_iters = 1000
 
 # Self-play: ~64 formulas × 2.5 samples/formula = ~160 samples/iter
-selfplay_batch_size = 64   # Parallel episodes (conservative for 60M model + 24GB)
-num_simulations = 8        # MCTS simulations per action
+selfplay_batch_size = 64
+num_simulations = 8
 
-# L4-only training
 max_train_formula_length = 4
-length_distribution = [0.0, 0.0, 0.0, 0.0, 1]          # 100% L4 generation
-training_length_distribution = [0.0, 0.0, 0.0, 0.0, 1]  # 100% L4 training
-min_success_ratio_per_length = [0.0, 0.0, 0.0, 0.0, 0.5]  # ≥50% successes in batch
-min_length_proportion = (0.0, 0.0, 0.0, 0.0, 1.0)  # L4-only (for curriculum if enabled)
+length_distribution = [0.0, 0.0, 0.0, 0.0, 1]
+training_length_distribution = [0.0, 0.0, 0.0, 0.0, 1]
+min_success_ratio_per_length = [0.0, 0.0, 0.0, 0.0, 0.5]
+min_length_proportion = (0.0, 0.0, 0.0, 0.0, 1.0)
 
 # Training: 160 samples / 32 batch = 5 steps/iter → replay ratio 1.0
 learning_rate = 0.0002
-training_batch_size = 32       # Minibatch size (conservative for 60M model)
-training_steps_per_iter = 5    # Multiple gradient updates (like pgx AlphaZero)
-pool_size = 1600               # ~10 iterations (160 × 10)
-protect_l4_successes = True    # Protect rare successes from eviction
-
-# # CPU/test config:
-# n_embd=16
-# n_head=2
-# n_encoder_layers=1
-# n_decoder_layers=1
-
-# # Training
-# seed = 0
-# max_num_iters = 20
-# selfplay_batch_size = 20#128  # Formulas per iteration
-# num_simulations = 3 #8  # MCTS simulations per action
-# max_train_formula_length = 4  # Filter out formulas longer than this (None = no filter)
-# length_distribution = [0.0, 0.0, 0.0, 0.0, 1]  # Distribution for generating formulas (index 0 unused, 1-4 are lengths). Updated by curriculum.
-# training_length_distribution = [0.0, 0.0, 0.0, 0.0, 1]  # Distribution for sampling training batches. Updated by curriculum.
-# min_success_ratio_per_length = [0.0, 0.0, 0.0, 0.0, 0.5]  # Minimum success ratio for each length in training batch
-# min_length_proportion = (0.0, 0.25, 0.25, 0.3, 0.2)  # Minimum proportion for each length when success rate is 1.0 (last is computed)
-# # temperature = 1.0  # Not used (gumbel_muzero_policy uses Gumbel sampling, not temperature)
-# learning_rate = 0.0002  # Matches Boolformer LEARNING_RATE
-# training_batch_size = 10  # Minibatch size for training
-# pool_size = 300  # Circular buffer size for sample pool
-# protect_l4_successes = False # Protect length-4 success samples from eviction
+training_batch_size = 32
+training_steps_per_iter = 5
+pool_size = 1600
+protect_l4_successes = True
 
 # Checkpointing
 checkpoint_interval = 1
@@ -98,23 +98,22 @@ def selfplay_single_episode(
     """
     Generate one episode with MCTS.
 
-    Returns lists of (encoder_output, formula_tokens, position, action_weights, reward, is_perfect) for each step.
+    encoder_output and points are passed via mctx params (not stored per tree node).
+    Returns (formula_tokens, position, action_weights, reward, is_perfect) per step.
     """
-    state = env.reset(rng_key, points, encoder_output)
+    state = env.reset(rng_key)
     max_steps = max_formula_length
 
     def step_fn(carry, step_rng_key):
         """One step of episode."""
         state = carry
 
-        # If already terminated, just pass through
         def active_step():
-            # Get root
-            root = root_fn(state)
+            # encoder_output passed to root_fn explicitly, and as params to mctx
+            root = root_fn(state, encoder_output)
 
-            # Run MCTS
             policy_output = mctx.gumbel_muzero_policy(
-                params=None,
+                params=(encoder_output, points),  # NOT stored per tree node
                 rng_key=step_rng_key,
                 root=root,
                 recurrent_fn=recurrent_fn,
@@ -122,19 +121,14 @@ def selfplay_single_episode(
                 qtransform=mctx.qtransform_completed_by_mix_value,
             )
 
-            # Take action
-            action = policy_output.action[0]  # Remove batch dim
-            action_weights = policy_output.action_weights[0]  # Remove batch dim
+            action = policy_output.action[0]
+            action_weights = policy_output.action_weights[0]
 
-            # DEBUG: Print MCTS output (train.py:112)
-            # jax.debug.print("🎯 [MCTS] selected_action={}, action_weights={}", action, action_weights)
-
-            next_state, reward, terminated, is_perfect = env.step(state, action)
+            next_state, reward, terminated, is_perfect = env.step(state, action, points)
 
             return next_state, action_weights, reward, is_perfect
 
         def terminated_step():
-            # Return dummy values
             return state, jnp.zeros(vocab_size), jnp.float32(0.0), jnp.bool_(False)
 
         next_state, action_weights, reward, is_perfect = jax.lax.cond(
@@ -143,12 +137,7 @@ def selfplay_single_episode(
             active_step
         )
 
-        # Store data
-        # TODO: Optimize memory - encoder_output is duplicated across all steps
-        #       Currently: (max_steps, max_points, n_embd) per episode
-        #       Could store once: (max_points, n_embd) per episode
         step_data = (
-            next_state.encoder_output,  # (max_points, n_embd)
             next_state.formula_tokens,  # (max_len,) - AFTER action
             state.position,  # scalar - position BEFORE action (where decision was made)
             action_weights,  # (vocab_size,)
@@ -158,10 +147,7 @@ def selfplay_single_episode(
 
         return next_state, step_data
 
-    # Generate RNG keys for all steps
     keys = jax.random.split(rng_key, max_steps)
-
-    # Run episode
     _, episode_data = jax.lax.scan(step_fn, state, keys)
 
     return episode_data
@@ -177,8 +163,8 @@ def selfplay_episode(
     """
     Generate batch of selfplay episodes.
 
-    Returns (points, batch_data) where batch_data is tuple of:
-        (encoder_outputs, formula_tokens, positions, action_weights, rewards)
+    Returns (points, encoder_outputs, batch_data, polish_exprs) where batch_data is tuple of:
+        (formula_tokens, positions, action_weights, rewards, is_perfect)
     """
     batch_size = selfplay_batch_size
 
@@ -198,17 +184,15 @@ def selfplay_episode(
     single_episode_fn = partial(selfplay_single_episode, model, env, root_fn, recurrent_fn)
 
     # vmap over (points, encoder_outputs, rng_key)
-    # Episode i gets: points[i] (max_points, num_variables), encoder_outputs[i] (max_points, n_embd), episode_keys[i]
     batch_data = jax.vmap(single_episode_fn)(points, encoder_outputs, episode_keys)
 
     # batch_data is tuple of arrays with shape (batch, max_steps, ...)
-    # batch_data[0]: encoder_outputs (batch, max_steps, max_points, n_embd)
-    # batch_data[1]: formula_tokens (batch, max_steps, max_len)
-    # batch_data[2]: positions (batch, max_steps)
-    # batch_data[3]: action_weights (batch, max_steps, vocab_size)
-    # batch_data[4]: rewards (batch, max_steps)
-    # batch_data[5]: is_perfect (batch, max_steps)
-    return points, batch_data, polish_exprs
+    # batch_data[0]: formula_tokens (batch, max_steps, max_len)
+    # batch_data[1]: positions (batch, max_steps)
+    # batch_data[2]: action_weights (batch, max_steps, vocab_size)
+    # batch_data[3]: rewards (batch, max_steps)
+    # batch_data[4]: is_perfect (batch, max_steps)
+    return points, encoder_outputs, batch_data, polish_exprs
 
 
 class SamplePool:
@@ -241,7 +225,7 @@ class SamplePool:
         # Write samples one by one, skipping protected slots if enabled
         write_idx = self.write_index
         for src_idx in range(num_new):
-            # Skip protected slots: length-4 successes (if protection enabled)
+            # Skip protected slots: length-4 successes (infinite-loops if pool is all L4 successes)
             if protect_l4_successes:
                 while (self.target_polish_exprs[write_idx] is not None and
                        len(self.target_polish_exprs[write_idx]) == 4 and
@@ -325,10 +309,10 @@ class SamplePool:
 
         Args:
             points: (batch, num_points, num_variables)
-            batch_data: tuple of (encoder_outputs, formula_tokens, positions, action_weights, rewards, is_perfect)
+            batch_data: tuple of (formula_tokens, positions, action_weights, rewards, is_perfect)
             polish_exprs: list of target polish expressions (one per episode)
         """
-        encoder_outputs, formula_tokens, positions, action_weights, rewards, is_perfect = batch_data
+        formula_tokens, positions, action_weights, rewards, is_perfect = batch_data
         batch_size, max_steps = rewards.shape
 
         # Compute value target for each step (final reward, no bootstrapping)
@@ -570,11 +554,11 @@ for iteration in range(max_num_iters):
     # Selfplay
     print(f"[Iter {iteration:04d}] Running selfplay...")
     rng_key, subkey = jax.random.split(rng_key)
-    points, batch_data, polish_exprs = selfplay_episode(model, env, root_fn, recurrent_fn, subkey)
+    points, encoder_outputs, batch_data, polish_exprs = selfplay_episode(model, env, root_fn, recurrent_fn, subkey)
 
     # Track episode success using is_perfect flag
-    rewards = batch_data[4]  # balanced accuracy values
-    is_perfect = batch_data[5]  # perfect match flags
+    rewards = batch_data[3]  # balanced accuracy values
+    is_perfect = batch_data[4]  # perfect match flags
     episode_success = jnp.any(is_perfect, axis=1)  # (batch,) - any step was perfect
     num_success = jnp.sum(episode_success).item()
     success_rate = num_success / selfplay_batch_size
@@ -586,7 +570,7 @@ for iteration in range(max_num_iters):
     iou_sum = np.zeros(len(length_distribution), dtype=float)
 
     # Get generated formula lengths from final step and max rewards per episode
-    formula_tokens = batch_data[1]
+    formula_tokens = batch_data[0]
     generated_lengths = jnp.sum(formula_tokens[:, -1, 1:] != 1, axis=1)
     max_rewards = jnp.max(rewards, axis=1)  # Best mIoU achieved in episode
 
@@ -612,15 +596,16 @@ for iteration in range(max_num_iters):
     print(f"  Episodes: {num_success}/{selfplay_batch_size} ({success_rate:.1%}) | {' | '.join(stats)}")
 
     # Check value prediction accuracy
-    encoder_outputs = batch_data[0]  # (batch, max_steps, num_points, n_embd)
-    formula_tokens_batch = batch_data[1]  # (batch, max_steps, max_len)
-    positions_batch = batch_data[2]  # (batch, max_steps)
-    actual_rewards = batch_data[4]  # (batch, max_steps)
+    # encoder_outputs: (batch, num_points, n_embd) — from selfplay_episode, computed once
+    formula_tokens_batch = batch_data[0]  # (batch, max_steps, max_len)
+    positions_batch = batch_data[1]  # (batch, max_steps)
+    actual_rewards = batch_data[3]  # (batch, max_steps)
 
     # Get value predictions for all steps in all episodes
     # Flatten batch to (batch*max_steps, ...)
     batch_size, max_steps = actual_rewards.shape
-    flat_encoder = encoder_outputs.reshape(-1, encoder_outputs.shape[2], encoder_outputs.shape[3])
+    # Repeat encoder_outputs for each step: (batch, num_points, n_embd) → (batch*max_steps, num_points, n_embd)
+    flat_encoder = jnp.repeat(encoder_outputs, max_steps, axis=0)
     flat_tokens = formula_tokens_batch.reshape(-1, formula_tokens_batch.shape[2])
     flat_positions = positions_batch.reshape(-1)
     flat_rewards = actual_rewards.reshape(-1)

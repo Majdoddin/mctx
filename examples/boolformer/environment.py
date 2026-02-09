@@ -56,10 +56,12 @@ class BoolformerConfig:
 
 
 class BoolformerState(NamedTuple):
-    """State of the Boolformer environment."""
+    """State of the Boolformer environment.
 
-    points: jax.Array  # (num_points, 10) minority class variable combinations (for reward computation)
-    encoder_output: jax.Array  # (num_points, n_embd) cached encoder output
+    Note: encoder_output and points are NOT stored here — they are constant
+    per episode and passed via mctx params to avoid duplication at every tree node.
+    """
+
     formula_tokens: jax.Array  # (max_length,) token sequence so far
     position: jax.Array  # Current position in formula (scalar)
     terminated: jax.Array  # Whether episode is done (scalar bool)
@@ -409,13 +411,11 @@ class BoolformerEnv:
         self.model = model
         self.config = config or BoolformerConfig()
 
-    def reset(self, key: jax.Array, points: jax.Array, encoder_output: jax.Array) -> BoolformerState:
-        """Reset environment with pre-computed encoder output.
+    def reset(self, key: jax.Array) -> BoolformerState:
+        """Reset environment to initial state.
 
         Args:
             key: JAX random key (unused)
-            points: Points array (num_points, 10) with values in {-1, 0, +1}
-            encoder_output: Pre-computed encoder output (num_points, n_embd)
         """
         formula_tokens = jnp.full((self.config.max_formula_length,), self.config.pad_token, dtype=jnp.int32)
         formula_tokens = formula_tokens.at[0].set(self.config.sos_token)
@@ -424,8 +424,6 @@ class BoolformerEnv:
         _, legal_action_mask = get_allowed_tokens(formula_tokens, position, self.config)
 
         return BoolformerState(
-            points=points,
-            encoder_output=encoder_output,
             formula_tokens=formula_tokens,
             position=position,
             terminated=jnp.bool_(False),
@@ -435,7 +433,8 @@ class BoolformerEnv:
     def step(
         self,
         state: BoolformerState,
-        action: jax.Array
+        action: jax.Array,
+        points: jax.Array,
     ) -> Tuple[BoolformerState, jax.Array, jax.Array, jax.Array]:
         """
         Take a step by adding a token to the formula.
@@ -443,6 +442,7 @@ class BoolformerEnv:
         Args:
             state: Current state
             action: Token to add (scalar in [0, vocab_size))
+            points: Minority class points (num_points, num_variables) — passed via params, not in state
 
         Returns:
             (next_state, reward, terminated, is_perfect)
@@ -461,7 +461,7 @@ class BoolformerEnv:
         # Use balanced accuracy [0.0, 1.0] as reward, also return is_perfect for logging
         reward, is_perfect = jax.lax.cond(
             terminated,
-            lambda: evaluate_formula_balanced_accuracy(formula_tokens, position, state.points, self.config),
+            lambda: evaluate_formula_balanced_accuracy(formula_tokens, position, points, self.config),
             lambda: (jnp.float32(0.0), jnp.bool_(False))
         )
 
@@ -499,38 +499,3 @@ class BoolformerEnv:
         return self.config.vocab_size
 
 
-def create_recurrent_fn(env: BoolformerEnv):
-    """
-    Create recurrent function for mctx MCTS.
-
-    This function takes a state and action, returns next state, reward, discount.
-    Required signature for mctx.
-
-    Returns:
-        recurrent_fn compatible with mctx
-    """
-    def recurrent_fn(params, rng_key, action, state):
-        """
-        Args:
-            params: Model parameters (not used in environment dynamics)
-            rng_key: Random key (not used for deterministic environment)
-            action: Action to take
-            state: Current BoolformerState
-
-        Returns:
-            recurrent_fn_output with (reward, discount, next_state)
-        """
-        next_state, reward, terminated = env.step(state, action)
-
-        # Discount is 0 if terminated, 1 otherwise (standard episodic setting)
-        discount = jnp.where(terminated, jnp.float32(0.0), jnp.float32(1.0))
-
-        # Return in mctx format
-        # mctx expects: (prior_logits, value, state) for RootFnOutput
-        # For recurrent_fn, we need: RecurrentFnOutput(reward, discount, prior_logits, value)
-        # But prior_logits and value come from the model, not environment
-        # So we just return the state changes here
-
-        return reward, discount, next_state
-
-    return recurrent_fn
