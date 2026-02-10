@@ -21,7 +21,7 @@ import optax
 from boolformer_jax_model import BoolformerTransformer
 from environment import BoolformerEnv, BoolformerConfig
 from mcts_integration import create_root_fn, create_recurrent_fn
-from generate_data import generate_formulas
+from generate_data import generate_formulas, NUM_PHYSICAL_CORES
 
 
 # Training configuration
@@ -547,7 +547,7 @@ def update_curriculum(success_counts, total_counts):
 # Training loop
 rng_key = jax.random.key(seed)
 
-print("\nStarting training...\n")
+print(f"\nStarting training... (formula gen: {NUM_PHYSICAL_CORES} physical cores)\n")
 for iteration in range(max_num_iters):
     iter_start = time.time()
 
