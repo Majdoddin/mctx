@@ -552,6 +552,7 @@ for iteration in range(max_num_iters):
     iter_start = time.time()
 
     # Selfplay
+    selfplay_start = time.time()
     print(f"[Iter {iteration:04d}] Running selfplay...")
     rng_key, subkey = jax.random.split(rng_key)
     points, encoder_outputs, batch_data, polish_exprs = selfplay_episode(model, env, root_fn, recurrent_fn, subkey)
@@ -631,13 +632,16 @@ for iteration in range(max_num_iters):
     else:
         print(f"  Value: SOS={mean_value_sos:.3f}")
 
+    selfplay_time = time.time() - selfplay_start
+
     # Add samples to pool
     pool.add_from_batch(points, batch_data, polish_exprs)
     print(f"  Pool: {pool.total_written} total written, write_index={pool.write_index}, full={pool.is_full}")
 
     # Training (only if pool is full)
     if not pool.is_full:
-        print(f"  Skipping training (pool not full yet)\n")
+        iter_time = time.time() - iter_start
+        print(f"  Skipping training (pool not full yet) | Time: {iter_time:.2f}s (selfplay={selfplay_time:.2f}s)\n")
         continue
 
     # Update curriculum based on pool statistics (using target formula lengths)
@@ -653,6 +657,7 @@ for iteration in range(max_num_iters):
     print(f"  Curriculum: gen={[f'{x:.2f}' for x in length_distribution[1:]]}, train={[f'{x:.2f}' for x in training_length_distribution[1:]]}")
 
     # Multiple training steps per iteration (like pgx AlphaZero)
+    train_start = time.time()
     print(f"  Training: {training_steps_per_iter} steps × {training_batch_size} batch...")
     grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
     policy_losses, value_losses = [], []
@@ -671,10 +676,11 @@ for iteration in range(max_num_iters):
     avg_value_loss = sum(value_losses) / len(value_losses)
     avg_loss = avg_policy_loss + avg_value_loss
 
+    train_time = time.time() - train_start
     iter_time = time.time() - iter_start
 
     print(f"  Loss: {avg_loss:.4f} (policy={avg_policy_loss:.4f}, value={avg_value_loss:.4f})")
-    print(f"  Time: {iter_time:.2f}s\n")
+    print(f"  Time: {iter_time:.2f}s (selfplay={selfplay_time:.2f}s, train={train_time:.2f}s)\n")
 
     # Checkpoint
     if iteration % checkpoint_interval == 0:
