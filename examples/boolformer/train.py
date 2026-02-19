@@ -153,7 +153,7 @@ def selfplay_single_episode(
     return episode_data
 
 
-@nnx.jit
+@nnx.jit(static_argnums=(1, 2, 3))
 def selfplay_jit(
     model: BoolformerTransformer,
     env: BoolformerEnv,
