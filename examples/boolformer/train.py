@@ -153,6 +153,29 @@ def selfplay_single_episode(
     return episode_data
 
 
+@nnx.jit
+def selfplay_jit(
+    model: BoolformerTransformer,
+    env: BoolformerEnv,
+    root_fn,
+    recurrent_fn,
+    points: jax.Array,
+    rng_key: jax.Array
+):
+    """JIT-compiled selfplay: encode + vmapped MCTS. Compiled once, reused every iteration."""
+    # Encode
+    encoder_outputs = model.encode_points(points)
+
+    # Generate keys for each episode
+    episode_keys = jax.random.split(rng_key, points.shape[0])
+
+    # Run episodes in parallel using vmap
+    single_episode_fn = partial(selfplay_single_episode, model, env, root_fn, recurrent_fn)
+    batch_data = jax.vmap(single_episode_fn)(points, encoder_outputs, episode_keys)
+
+    return encoder_outputs, batch_data
+
+
 def selfplay_episode(
     model: BoolformerTransformer,
     env: BoolformerEnv,
@@ -168,30 +191,14 @@ def selfplay_episode(
     """
     batch_size = selfplay_batch_size
 
-    # Generate minority points using Boolformer formula generator
-    # TODO: Convert to JAX for JIT compilation (currently uses Python/NumPy)
-    max_gen_length = max_train_formula_length if max_train_formula_length is not None else 50  # TODO: Make default configurable
+    # Generate minority points (Python/NumPy — outside JIT)
+    max_gen_length = max_train_formula_length if max_train_formula_length is not None else 50
     points_array, polish_exprs = generate_formulas(batch_size, num_variables, max_gen_length, length_distribution)
-    points = jnp.array(points_array)  # (batch_size, max_points, num_variables)
+    points = jnp.array(points_array)
 
-    # Batch encode all points at once: (batch_size, max_points, num_variables) -> (batch_size, max_points, n_embd)
-    encoder_outputs = model.encode_points(points)
+    # JIT-compiled: encode + MCTS selfplay
+    encoder_outputs, batch_data = selfplay_jit(model, env, root_fn, recurrent_fn, points, rng_key)
 
-    # Generate keys for each episode
-    episode_keys = jax.random.split(rng_key, batch_size)
-
-    # Run episodes in parallel using vmap
-    single_episode_fn = partial(selfplay_single_episode, model, env, root_fn, recurrent_fn)
-
-    # vmap over (points, encoder_outputs, rng_key)
-    batch_data = jax.vmap(single_episode_fn)(points, encoder_outputs, episode_keys)
-
-    # batch_data is tuple of arrays with shape (batch, max_steps, ...)
-    # batch_data[0]: formula_tokens (batch, max_steps, max_len)
-    # batch_data[1]: positions (batch, max_steps)
-    # batch_data[2]: action_weights (batch, max_steps, vocab_size)
-    # batch_data[3]: rewards (batch, max_steps)
-    # batch_data[4]: is_perfect (batch, max_steps)
     return points, encoder_outputs, batch_data, polish_exprs
 
 
