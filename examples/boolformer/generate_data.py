@@ -5,7 +5,7 @@ import sys
 import time
 import numpy as np
 from pathlib import Path
-from multiprocessing import Pool as ProcessPool
+import multiprocessing
 
 # Add Boolformer src to path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
@@ -151,7 +151,8 @@ def generate_formulas(n, num_variables, max_formula_length, length_distribution=
     per_worker = int(np.ceil(n / num_workers)) * 2  # 2x to reduce re-runs
     worker_args = [(per_worker, num_variables, max_formula_length, target_lengths)] * num_workers
 
-    with ProcessPool(num_workers) as pool:
+    ctx = multiprocessing.get_context("spawn")
+    with ctx.Pool(num_workers) as pool:
         worker_results = pool.map(_worker_generate, worker_args)
 
     # Merge results
