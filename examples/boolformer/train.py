@@ -545,6 +545,7 @@ def update_curriculum(success_counts, total_counts):
     return new_gen_dist, new_train_dist
 
 # Training loop
+jax.log_compiles()
 rng_key = jax.random.key(seed)
 
 print(f"\nStarting training... (formula gen: {NUM_PHYSICAL_CORES} physical cores)\n")
