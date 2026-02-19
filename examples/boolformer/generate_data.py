@@ -1,5 +1,6 @@
 """Generate formulas for testing Boolformer environment."""
 
+import atexit
 import os
 import sys
 import time
@@ -39,6 +40,11 @@ def _get_physical_cores():
 
 
 NUM_PHYSICAL_CORES = _get_physical_cores()
+
+# Persistent pool created at import time (before JAX GPU init), so workers don't inherit GPU mappings.
+# Workers only use PyTorch/NumPy — JAX fork warning is harmless.
+_pool = ProcessPool(NUM_PHYSICAL_CORES)
+atexit.register(_pool.terminate)
 
 
 def token_to_id(token):
@@ -151,10 +157,7 @@ def generate_formulas(n, num_variables, max_formula_length, length_distribution=
     per_worker = int(np.ceil(n / num_workers)) * 2  # 2x to reduce re-runs
     worker_args = [(per_worker, num_variables, max_formula_length, target_lengths)] * num_workers
 
-    # Uses fork (default). JAX warns about os.fork() but workers only use PyTorch/NumPy.
-    # spawn won't work: re-imports train.py in each worker, breaking flax imports.
-    with ProcessPool(num_workers) as pool:
-        worker_results = pool.map(_worker_generate, worker_args)
+    worker_results = _pool.map(_worker_generate, worker_args)
 
     # Merge results
     all_points = []
