@@ -63,8 +63,8 @@ n_decoder_layers = 8   # NUM_DECODER_LAYERS
 seed = 0
 max_num_iters = 1000
 
-# Self-play: ~64 formulas × 2.5 samples/formula = ~160 samples/iter
-selfplay_batch_size = 64
+# Self-play: ~256 formulas × 2.5 samples/formula = ~640 samples/iter
+selfplay_batch_size = 256
 num_simulations = 8
 
 max_train_formula_length = 4
@@ -73,11 +73,11 @@ training_length_distribution = [0.0, 0.0, 0.0, 0.0, 1]
 min_success_ratio_per_length = [0.0, 0.0, 0.0, 0.0, 0.5]
 min_length_proportion = (0.0, 0.0, 0.0, 0.0, 1.0)
 
-# Training: 160 samples / 32 batch = 5 steps/iter → replay ratio 1.0
+# Training: 640 samples / 128 batch = 5 steps/iter → replay ratio 1.0
 learning_rate = 0.0002
-training_batch_size = 32
+training_batch_size = 128
 training_steps_per_iter = 5
-pool_size = 1600
+pool_size = 6400
 protect_l4_successes = True
 
 # Checkpointing
@@ -552,6 +552,8 @@ def update_curriculum(success_counts, total_counts):
     return new_gen_dist, new_train_dist
 
 # Training loop
+import logging
+logging.basicConfig()
 jax.log_compiles()
 rng_key = jax.random.key(seed)
 
