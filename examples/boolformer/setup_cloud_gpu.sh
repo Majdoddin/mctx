@@ -88,20 +88,14 @@ source .venv/bin/activate
 pip install --no-cache-dir --upgrade pip
 echo "✓ Virtual environment ready"'
 
-# Install JAX with CUDA support
+# Install JAX with bundled CUDA/CuDNN.
+# jax[cuda12_local] would avoid ~2GB download but only works with exact CUDA 12
+# system libs (not CUDA 13) and CuDNN >= 9.8. Too fragile for varying cloud images.
 echo -e "\n[6/8] Installing JAX with CUDA support..."
 run_remote "Install JAX" 'set -e
 cd ~/Boolformer
 source .venv/bin/activate
-CUDA_VERSION=$(nvcc --version 2>/dev/null | grep -oP "release \K[0-9]+" | head -1)
-echo "System CUDA major version: ${CUDA_VERSION:-not found}"
-if [ "$CUDA_VERSION" -ge 12 ] 2>/dev/null; then
-    echo "Using system CUDA $CUDA_VERSION — installing jax[cuda12_local]"
-    pip install --no-cache-dir -U "jax[cuda12_local]"
-else
-    echo "No compatible system CUDA — installing jax[cuda12] (includes CUDA pip packages)"
-    pip install --no-cache-dir -U "jax[cuda12]"
-fi
+pip install --no-cache-dir -U "jax[cuda12]"
 echo "✓ JAX with CUDA installed"'
 
 # Install Python dependencies
