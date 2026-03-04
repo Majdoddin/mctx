@@ -120,7 +120,12 @@ cd mctx
 pip install --no-cache-dir -e .
 cd ..
 
-# Install Boolformer dependencies
+# Install PyTorch CPU-only: formula generation (src/) uses torch for tensor ops
+# but never needs GPU. GPU torch pins exact CUDA lib versions (==) that conflict
+# with JAX's CUDA libs and adds ~3GB of redundant downloads.
+pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+# Install remaining Boolformer dependencies (excluding torch)
 pip install --no-cache-dir -r requirements.txt
 
 echo "✓ All Python packages installed"
