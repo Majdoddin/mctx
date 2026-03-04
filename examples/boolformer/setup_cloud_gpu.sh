@@ -38,6 +38,18 @@ else
     echo "========================================="
 fi
 
+# Helper: run command over SSH, abort on failure
+run_remote() {
+    local step_name="$1"
+    shift
+    if ! ssh $SSH_OPTS $SSH_HOST "$@"; then
+        echo "ERROR: Step '$step_name' failed!"
+        # Close persistent connection before exiting
+        ssh -S "$SSH_SOCKET" -O exit $SSH_HOST 2>/dev/null || true
+        exit 1
+    fi
+}
+
 # Establish persistent SSH connection
 echo -e "\n[1/8] Establishing persistent SSH connection..."
 ssh -M -S "$SSH_SOCKET" $SSH_OPTS -o ControlPersist=10m $SSH_HOST -N -f
@@ -48,109 +60,80 @@ SSH_OPTS="-S $SSH_SOCKET"
 
 # Test connection
 echo -e "\n[2/8] Testing connection..."
-ssh $SSH_OPTS $SSH_HOST "echo 'SSH connection successful'"
+run_remote "Test connection" "echo 'SSH connection successful'"
 
 # Install system dependencies
 echo -e "\n[3/8] Installing system dependencies..."
-ssh $SSH_OPTS $SSH_HOST << 'EOF'
-apt-get update
-apt-get install -y git python3 python3-venv python3-pip
-EOF
+run_remote "Install system dependencies" "set -e; apt-get update && apt-get install -y git python3 python3-venv python3-pip"
 
 # Clone repositories
 echo -e "\n[4/8] Cloning repositories..."
-ssh $SSH_OPTS $SSH_HOST << 'EOF'
+run_remote "Clone repositories" 'set -e
 cd ~
-
-# Clone Boolformer
 git clone https://github.com/arthurenard/Boolformer.git
 echo "✓ Cloned Boolformer"
-
-# Clone mctx inside Boolformer (matches local structure)
 cd ~/Boolformer
 git clone -b boolformer-example https://github.com/Majdoddin/mctx.git
 echo "✓ Cloned mctx (boolformer-example branch)"
-
-# Clone flax inside Boolformer (matches local structure)
 git clone -b rope-rmsnorm https://github.com/Majdoddin/flax.git
-echo "✓ Cloned flax (rope-rmsnorm branch)"
-EOF
+echo "✓ Cloned flax (rope-rmsnorm branch)"'
 
 # Create virtual environment and install dependencies
 echo -e "\n[5/8] Creating virtual environment..."
-ssh $SSH_OPTS $SSH_HOST << 'EOF'
+run_remote "Create virtual environment" 'set -e
 cd ~/Boolformer
-
 python3 -m venv .venv
 echo "✓ Created .venv"
-
 source .venv/bin/activate
-
-# Upgrade pip
 pip install --no-cache-dir --upgrade pip
-
-echo "✓ Virtual environment ready"
-EOF
+echo "✓ Virtual environment ready"'
 
 # Install JAX with CUDA support
 echo -e "\n[6/8] Installing JAX with CUDA support..."
-ssh $SSH_OPTS $SSH_HOST << 'EOF'
+run_remote "Install JAX" 'set -e
 cd ~/Boolformer
 source .venv/bin/activate
-
-# Install JAX with CUDA 12 support (compatible with CUDA 13.0)
-pip install --no-cache-dir -U "jax[cuda12]"
-
-echo "✓ JAX with CUDA installed"
-EOF
+CUDA_VERSION=$(nvcc --version 2>/dev/null | grep -oP "release \K[0-9]+" | head -1)
+echo "System CUDA major version: ${CUDA_VERSION:-not found}"
+if [ "$CUDA_VERSION" -ge 12 ] 2>/dev/null; then
+    echo "Using system CUDA $CUDA_VERSION — installing jax[cuda12_local]"
+    pip install --no-cache-dir -U "jax[cuda12_local]"
+else
+    echo "No compatible system CUDA — installing jax[cuda12] (includes CUDA pip packages)"
+    pip install --no-cache-dir -U "jax[cuda12]"
+fi
+echo "✓ JAX with CUDA installed"'
 
 # Install Python dependencies
 echo -e "\n[7/8] Installing Python dependencies..."
-ssh $SSH_OPTS $SSH_HOST << 'EOF'
+run_remote "Install Python dependencies" 'set -e
 cd ~/Boolformer
 source .venv/bin/activate
-
-# Install custom flax
-cd flax
-pip install --no-cache-dir -e .
-cd ..
-
-# Install mctx
-cd mctx
-pip install --no-cache-dir -e .
-cd ..
-
-# Install PyTorch CPU-only: formula generation (src/) uses torch for tensor ops
-# but never needs GPU. GPU torch pins exact CUDA lib versions (==) that conflict
-# with JAX's CUDA libs and adds ~3GB of redundant downloads.
+cd flax && pip install --no-cache-dir -e . && cd ..
+echo "✓ Installed flax"
+cd mctx && pip install --no-cache-dir -e . && cd ..
+echo "✓ Installed mctx"
 pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
-
-# Install remaining Boolformer dependencies (excluding torch)
+echo "✓ Installed PyTorch (CPU-only)"
 pip install --no-cache-dir -r requirements.txt
-
-echo "✓ All Python packages installed"
-EOF
+echo "✓ All Python packages installed"'
 
 # Verify installation
 echo -e "\n[8/8] Verifying installation..."
-ssh $SSH_OPTS $SSH_HOST << 'EOF'
+run_remote "Verify installation" 'set -e
 cd ~/Boolformer
 source .venv/bin/activate
-
 echo "Checking JAX GPU support..."
-python3 -c "import jax; print(f'JAX version: {jax.__version__}'); print(f'Devices: {jax.devices()}'); print(f'Default backend: {jax.default_backend()}')"
-
+python3 -c "import jax; print(f'"'"'JAX version: {jax.__version__}'"'"'); print(f'"'"'Devices: {jax.devices()}'"'"'); print(f'"'"'Default backend: {jax.default_backend()}'"'"')"
 echo ""
 echo "Checking installed packages..."
 pip list | grep -E "(jax|flax|mctx|numpy|optax)"
-
 echo ""
-echo "✓ Installation verification complete"
-EOF
+echo "✓ Installation verification complete"'
 
 # Disable auto-tmux for future logins
 echo -e "\nDisabling auto-tmux..."
-ssh $SSH_OPTS $SSH_HOST "touch ~/.no_auto_tmux"
+run_remote "Disable auto-tmux" "touch ~/.no_auto_tmux"
 echo "✓ Auto-tmux disabled"
 
 # Close persistent SSH connection
@@ -164,12 +147,12 @@ echo "Setup complete!"
 echo "========================================="
 echo ""
 echo "To start training:"
-echo "1. SSH to the server: ssh -p $SSH_PORT $SSH_HOST"
+echo "1. SSH to the server: ssh $SSH_HOST"
 echo "2. Activate venv: source ~/Boolformer/.venv/bin/activate"
 echo "3. Navigate to: cd ~/Boolformer/mctx/examples/boolformer"
 echo "4. Run training: python train.py"
 echo ""
 echo "To update code on cloud (after pushing local changes):"
-echo "ssh -p $SSH_PORT $SSH_HOST 'cd ~/Boolformer/mctx && git pull'"
-echo "ssh -p $SSH_PORT $SSH_HOST 'cd ~/Boolformer/flax && git pull'"
+echo "ssh $SSH_HOST 'cd ~/Boolformer/mctx && git pull'"
+echo "ssh $SSH_HOST 'cd ~/Boolformer/flax && git pull'"
 echo ""
