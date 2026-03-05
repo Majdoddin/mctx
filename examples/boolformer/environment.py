@@ -281,8 +281,18 @@ def evaluate_formula_balanced_accuracy(
     union_zeros = num_truth_zeros + num_pred_zeros - correct_zeros
     iou_zeros = correct_zeros / jnp.maximum(union_zeros, 1.0)
 
-    # Mean IoU: average of ones and zeros
-    miou = 0.5 * iou_ones + 0.5 * iou_zeros
+    # Baseline-adjusted IoU: subtract expected random IoU per class, normalize to [0, 1].
+    # A random predictor (p=0.5) gets E[IoU] = truth_count*0.5 / (truth_count + n/2 - truth_count*0.5).
+    # Without this, random formulas score ~0.33-0.5, compressing the useful reward range.
+    num_rows_f = jnp.float32(num_rows)
+    expected_iou_ones = (num_truth_ones * 0.5) / jnp.maximum(num_truth_ones + num_rows_f / 2 - num_truth_ones * 0.5, 1.0)
+    expected_iou_zeros = (num_truth_zeros * 0.5) / jnp.maximum(num_truth_zeros + num_rows_f / 2 - num_truth_zeros * 0.5, 1.0)
+
+    adjusted_iou_ones = jnp.maximum(0.0, (iou_ones - expected_iou_ones) / jnp.maximum(1.0 - expected_iou_ones, 1e-6))
+    adjusted_iou_zeros = jnp.maximum(0.0, (iou_zeros - expected_iou_zeros) / jnp.maximum(1.0 - expected_iou_zeros, 1e-6))
+
+    # Mean adjusted IoU: random -> 0, perfect -> 1
+    miou = 0.5 * adjusted_iou_ones + 0.5 * adjusted_iou_zeros
     is_perfect = (correct_ones == num_truth_ones) & (correct_zeros == num_truth_zeros)
 
     return miou, is_perfect
