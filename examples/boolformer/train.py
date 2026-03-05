@@ -70,7 +70,7 @@ num_simulations = 8
 max_train_formula_length = 4
 length_distribution = [0.0, 0.0, 0.0, 0.0, 1]
 training_length_distribution = [0.0, 0.0, 0.0, 0.0, 1]
-min_success_ratio_per_length = [0.0, 0.0, 0.0, 0.0, 0.5]
+min_success_ratio_per_length = [0.0, 0.0, 0.0, 0.0, 0.3]
 min_length_proportion = (0.0, 0.0, 0.0, 0.0, 1.0)
 
 # Training: 640 samples / 128 batch = 5 steps/iter → replay ratio 1.0
@@ -78,7 +78,7 @@ learning_rate = 0.0002
 training_batch_size = 128
 training_steps_per_iter = 5
 pool_size = 6400
-protect_l4_successes = True
+protect_l4_successes = False
 
 # Checkpointing
 checkpoint_interval = 1
