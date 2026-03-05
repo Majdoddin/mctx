@@ -451,7 +451,12 @@ def loss_fn(
     policy_loss_mean = jnp.mean(weighted_policy_losses)
     value_loss_mean = jnp.mean(value_losses)
 
-    total_loss = policy_loss_mean + value_loss_mean
+    # Value loss multiplier: cross-entropy (policy) is inherently ~10x larger than
+    # MSE on [0,1] (value). Without this, shared backbone gradients are dominated by
+    # policy, starving the value head. TODO: consider adaptive balancing (e.g. matching
+    # gradient norms or tracking running ratio of the two losses).
+    value_loss_weight = 10.0
+    total_loss = policy_loss_mean + value_loss_weight * value_loss_mean
 
     return total_loss, (policy_loss_mean, value_loss_mean)
 
@@ -702,7 +707,7 @@ for iteration in range(max_num_iters):
     # Average losses across training steps
     avg_policy_loss = sum(policy_losses) / len(policy_losses)
     avg_value_loss = sum(value_losses) / len(value_losses)
-    avg_loss = avg_policy_loss + avg_value_loss
+    avg_loss = avg_policy_loss + 10.0 * avg_value_loss
 
     train_time = time.time() - train_start
     iter_time = time.time() - iter_start
