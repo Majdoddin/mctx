@@ -305,6 +305,7 @@ class SamplePool:
         # Normalize and sample
         weights = weights / weights.sum()
         indices = np.random.choice(self.pool_size, size=batch_size, replace=False, p=weights)
+        self._last_sample_success_count = int(self.is_perfect[indices].sum())
 
         # Convert NumPy → JAX for training
         return (
@@ -712,7 +713,8 @@ for iteration in range(max_num_iters):
     train_time = time.time() - train_start
     iter_time = time.time() - iter_start
 
-    print(f"  Loss: {avg_loss:.4f} (policy={avg_policy_loss:.4f}, value={avg_value_loss:.4f})")
+    print(f"  Loss: {avg_loss:.4f} (policy={avg_policy_loss:.4f}, value={avg_value_loss:.4f}) "
+          f"[last batch: {pool._last_sample_success_count}/{training_batch_size} success]")
     print(f"  Time: {iter_time:.2f}s (selfplay={selfplay_time:.2f}s, train={train_time:.2f}s)\n")
 
     # Checkpoint
