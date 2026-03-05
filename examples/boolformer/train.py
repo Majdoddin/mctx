@@ -441,8 +441,14 @@ def loss_fn(
     )
     # policy_losses, value_losses: (batch,)
 
-    # Uniform weighting for continuous rewards
-    policy_loss_mean = jnp.mean(policy_losses)
+    # Reward-weighted policy loss (REINFORCE-inspired):
+    # MCTS action weights from low-reward episodes are near-random (especially with
+    # few simulations and a weak value head). Training the policy on these noisy targets
+    # teaches randomness. Weighting by value_target means: learn strongly from episodes
+    # where the formula was good, ignore episodes where MCTS was just guessing.
+    # Value loss is unweighted — the value head should learn from all outcomes.
+    weighted_policy_losses = policy_losses * value_targets
+    policy_loss_mean = jnp.mean(weighted_policy_losses)
     value_loss_mean = jnp.mean(value_losses)
 
     total_loss = policy_loss_mean + value_loss_mean
