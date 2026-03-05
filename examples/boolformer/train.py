@@ -219,8 +219,9 @@ class SamplePool:
         self.positions = np.zeros(pool_size, dtype=np.int32)
         self.policy_targets = np.zeros((pool_size, vocab_size), dtype=np.float32)
         self.value_targets = np.zeros(pool_size, dtype=np.float32)
+        self.is_perfect = np.zeros(pool_size, dtype=bool)
 
-    def add_samples(self, points, formula_tokens, target_polish_exprs, positions, policy_targets, value_targets):
+    def add_samples(self, points, formula_tokens, target_polish_exprs, positions, policy_targets, value_targets, is_perfect):
         """Add batch of samples to pool (circular overwrite)."""
         # Convert JAX → NumPy
         points = np.array(points)
@@ -228,6 +229,7 @@ class SamplePool:
         positions = np.array(positions)
         policy_targets = np.array(policy_targets)
         value_targets = np.array(value_targets)
+        is_perfect = np.array(is_perfect)
 
         num_new = len(points)
 
@@ -238,7 +240,7 @@ class SamplePool:
             if protect_l4_successes:
                 while (self.target_polish_exprs[write_idx] is not None and
                        len(self.target_polish_exprs[write_idx]) == 4 and
-                       self.value_targets[write_idx] == 1.0):
+                       self.is_perfect[write_idx]):
                     write_idx = (write_idx + 1) % self.pool_size
 
             # Write sample
@@ -248,6 +250,7 @@ class SamplePool:
             self.positions[write_idx] = positions[src_idx]
             self.policy_targets[write_idx] = policy_targets[src_idx]
             self.value_targets[write_idx] = value_targets[src_idx]
+            self.is_perfect[write_idx] = is_perfect[src_idx]
 
             write_idx = (write_idx + 1) % self.pool_size
 
@@ -281,7 +284,7 @@ class SamplePool:
             length_mask = (formula_lengths == length)
             total_count[length] = length_mask.sum()
             if total_count[length] > 0:
-                success_count[length] = ((self.value_targets == 1.0) & length_mask).sum()
+                success_count[length] = (self.is_perfect & length_mask).sum()
                 success_ratio[length] = success_count[length] / total_count[length]
 
         # Pass 2: Compute weights per sample
@@ -296,7 +299,7 @@ class SamplePool:
                 boost = (min_success_ratio_per_length[length] * (1 - success_ratio[length])) / (success_ratio[length] * (1 - min_success_ratio_per_length[length]) + 1e-8)
 
                 # Apply boost to successes of this length
-                length_and_success = (formula_lengths == length) & (self.value_targets == 1.0)
+                length_and_success = (formula_lengths == length) & self.is_perfect
                 weights[length_and_success] *= boost
 
         # Normalize and sample
@@ -318,7 +321,7 @@ class SamplePool:
 
         Args:
             points: (batch, num_points, num_variables)
-            batch_data: tuple of (formula_tokens, positions, action_weights, rewards, is_perfect)
+            batch_data: tuple of (formula_tokens, positions, action_weights, rewards, is_perfect, terminated_flags)
             polish_exprs: list of target polish expressions (one per episode)
         """
         formula_tokens, positions, action_weights, rewards, is_perfect, terminated_flags = batch_data
@@ -349,12 +352,18 @@ class SamplePool:
         value_targets_flat = value_targets.reshape(-1)  # (batch*max_steps,)
         mask_flat = valid_mask.reshape(-1)  # (batch*max_steps,)
 
+        # is_perfect per episode → broadcast to all steps, then flatten
+        episode_perfect = jnp.any(is_perfect, axis=1)  # (batch,)
+        perfect_repeated = jnp.broadcast_to(episode_perfect[:, None], (batch_size, max_steps))
+        perfect_flat = perfect_repeated.reshape(-1)
+
         # Filter by mask - only add valid samples
         points_filtered = points_flat[mask_flat]
         formula_tokens_filtered = formula_tokens_flat[mask_flat]
         positions_filtered = positions_flat[mask_flat]
         policy_targets_filtered = policy_targets_flat[mask_flat]
         value_targets_filtered = value_targets_flat[mask_flat]
+        perfect_filtered = perfect_flat[mask_flat]
 
         # Repeat polish_exprs: each episode's expr repeated for its valid samples
         polish_exprs_filtered = [polish_exprs[i] for i in range(batch_size) for _ in range(int(jnp.sum(valid_mask[i])))]
@@ -371,6 +380,7 @@ class SamplePool:
             positions_filtered,
             policy_targets_filtered,
             value_targets_filtered,
+            perfect_filtered,
         )
 
 
@@ -663,7 +673,7 @@ for iteration in range(max_num_iters):
     for length in range(1, len(length_distribution)):
         length_mask = (pool_expr_lengths == length)
         pool_total_counts[length] = length_mask.sum()
-        pool_success_counts[length] = ((pool.value_targets == 1.0) & length_mask).sum()
+        pool_success_counts[length] = (pool.is_perfect & length_mask).sum()
 
     # length_distribution[:], training_length_distribution[:] = update_curriculum(pool_success_counts, pool_total_counts)
     print(f"  Curriculum: gen={[f'{x:.2f}' for x in length_distribution[1:]]}, train={[f'{x:.2f}' for x in training_length_distribution[1:]]}")
