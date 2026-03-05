@@ -124,14 +124,15 @@ def selfplay_single_episode(
             action = policy_output.action[0]
             action_weights = policy_output.action_weights[0]
 
-            next_state, reward, terminated, is_perfect = env.step(state, action, points)
+            next_state, reward, done, is_perfect = env.step(state, action, points)
 
-            return next_state, action_weights, reward, is_perfect
+            return next_state, action_weights, reward, is_perfect, done
 
         def terminated_step():
-            return state, jnp.zeros(vocab_size), jnp.float32(0.0), jnp.bool_(False)
+            # Already terminated: done=False (not a new termination, just padding)
+            return state, jnp.zeros(vocab_size), jnp.float32(0.0), jnp.bool_(False), jnp.bool_(False)
 
-        next_state, action_weights, reward, is_perfect = jax.lax.cond(
+        next_state, action_weights, reward, is_perfect, done = jax.lax.cond(
             state.terminated,
             terminated_step,
             active_step
@@ -143,6 +144,7 @@ def selfplay_single_episode(
             action_weights,  # (vocab_size,)
             reward,  # scalar
             is_perfect,  # scalar bool
+            done,  # scalar bool - whether this step ended the episode
         )
 
         return next_state, step_data
@@ -319,17 +321,17 @@ class SamplePool:
             batch_data: tuple of (formula_tokens, positions, action_weights, rewards, is_perfect)
             polish_exprs: list of target polish expressions (one per episode)
         """
-        formula_tokens, positions, action_weights, rewards, is_perfect = batch_data
+        formula_tokens, positions, action_weights, rewards, is_perfect, terminated_flags = batch_data
         batch_size, max_steps = rewards.shape
 
         # Compute value target for each step (final reward, no bootstrapping)
         final_rewards = jnp.sum(rewards, axis=1)  # (batch,)
         value_targets = jnp.broadcast_to(final_rewards[:, None], (batch_size, max_steps))  # (batch, max_steps)
 
-        # Create mask for valid steps
-        terminated = rewards != 0.0
-        terminated_cumsum = jnp.cumsum(terminated, axis=1)
-        valid_mask = (terminated_cumsum == 0) | terminated  # (batch, max_steps)
+        # Create mask for valid steps using terminated flag (not rewards != 0,
+        # which breaks with adjusted IoU where terminated episodes can have reward 0)
+        terminated_cumsum = jnp.cumsum(terminated_flags, axis=1)
+        valid_mask = (terminated_cumsum == 0) | terminated_flags  # (batch, max_steps)
 
         # Extract final formula for each episode (last valid step)
         last_valid_idx = jnp.sum(valid_mask, axis=1) - 1  # (batch,)
