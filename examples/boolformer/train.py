@@ -79,6 +79,7 @@ training_batch_size = 128
 training_steps_per_iter = 5
 pool_size = 6400
 protect_l4_successes = False
+iou_baseline_ema_rate = 0.9  # EMA rate for tracking average raw IoU (excluding perfects)
 
 # Checkpointing
 checkpoint_interval = 1
@@ -259,15 +260,16 @@ class SamplePool:
         if self.total_written >= self.pool_size:
             self.is_full = True
 
-    def sample_batch(self, batch_size: int, rng_key: jax.Array, length_distribution, min_success_ratio_per_length):
+    def sample_batch(self, batch_size: int, rng_key: jax.Array, length_distribution, min_success_ratio_per_length, iou_baseline: float = 0.0):
         """
-        Sample batch from pool with length distribution and per-length success ratios.
+        Sample batch from pool with length distribution and above-average IoU boosting.
 
         Args:
             batch_size: Number of samples to draw
             rng_key: Not used (using NumPy random)
             length_distribution: tuple of proportions per length (e.g., (0.0, 0.2, 0.3, 0.25, 0.25))
-            min_success_ratio_per_length: tuple of min success ratios per length (e.g., (0.0, 0.2, 0.3, 0.2, 0.1))
+            min_success_ratio_per_length: min ratio of above-average samples per length
+            iou_baseline: current EMA baseline; samples with value_target > baseline are "above average"
         """
         # Compute formula lengths (count non-padding tokens, exclude SOS at position 0)
         # <PAD> = 1, <SOS> = 0
@@ -275,37 +277,38 @@ class SamplePool:
 
         max_len = len(length_distribution)
 
+        # Above-average mask: samples with IoU above the adaptive baseline
+        above_average = self.value_targets > iou_baseline
+
         # Pass 1: Gather statistics per length
         total_count = np.zeros(max_len, dtype=int)
-        success_count = np.zeros(max_len, dtype=int)
-        success_ratio = np.zeros(max_len, dtype=float)
+        above_count = np.zeros(max_len, dtype=int)
+        above_ratio = np.zeros(max_len, dtype=float)
 
         for length in range(1, max_len):
             length_mask = (formula_lengths == length)
             total_count[length] = length_mask.sum()
             if total_count[length] > 0:
-                success_count[length] = (self.is_perfect & length_mask).sum()
-                success_ratio[length] = success_count[length] / total_count[length]
+                above_count[length] = (above_average & length_mask).sum()
+                above_ratio[length] = above_count[length] / total_count[length]
 
         # Pass 2: Compute weights per sample
         weights = np.array(length_distribution)[formula_lengths]  # Start with length distribution
 
-        # Boost successes for lengths that need more successes
-        # NOTE: Boosting successes increases total weight for that length, breaking exact length distribution.
-        # To maintain exact distribution, would need to proportionally reduce failures.
+        # Boost above-average samples for lengths that need more
         for length in range(1, max_len):
-            if success_ratio[length] < min_success_ratio_per_length[length] and success_ratio[length] > 0:
-                # Compute boost factor to achieve target success ratio
-                boost = (min_success_ratio_per_length[length] * (1 - success_ratio[length])) / (success_ratio[length] * (1 - min_success_ratio_per_length[length]) + 1e-8)
+            if above_ratio[length] < min_success_ratio_per_length[length] and above_ratio[length] > 0:
+                # Compute boost factor to achieve target above-average ratio
+                boost = (min_success_ratio_per_length[length] * (1 - above_ratio[length])) / (above_ratio[length] * (1 - min_success_ratio_per_length[length]) + 1e-8)
 
-                # Apply boost to successes of this length
-                length_and_success = (formula_lengths == length) & self.is_perfect
-                weights[length_and_success] *= boost
+                # Apply boost to above-average samples of this length
+                length_and_above = (formula_lengths == length) & above_average
+                weights[length_and_above] *= boost
 
         # Normalize and sample
         weights = weights / weights.sum()
         indices = np.random.choice(self.pool_size, size=batch_size, replace=False, p=weights)
-        self._last_sample_success_count = int(self.is_perfect[indices].sum())
+        self._last_sample_above_avg_count = int(above_average[indices].sum())
 
         # Convert NumPy → JAX for training
         return (
@@ -332,8 +335,7 @@ class SamplePool:
         final_rewards = jnp.sum(rewards, axis=1)  # (batch,)
         value_targets = jnp.broadcast_to(final_rewards[:, None], (batch_size, max_steps))  # (batch, max_steps)
 
-        # Create mask for valid steps using terminated flag (not rewards != 0,
-        # which breaks with adjusted IoU where terminated episodes can have reward 0)
+        # Create mask for valid steps using terminated flag (not rewards != 0)
         terminated_cumsum = jnp.cumsum(terminated_flags, axis=1)
         valid_mask = (terminated_cumsum == 0) | terminated_flags  # (batch, max_steps)
 
@@ -580,6 +582,8 @@ import logging
 logging.basicConfig()
 jax.log_compiles()
 rng_key = jax.random.key(seed)
+iou_baseline = None  # Initialized from pool-fill iterations
+iou_warmup_samples = []  # Accumulate during pool fill
 
 print(f"\nStarting training... (formula gen: {NUM_PHYSICAL_CORES} physical cores)\n")
 for iteration in range(max_num_iters):
@@ -623,12 +627,22 @@ for iteration in range(max_num_iters):
         if total_counts[i] > 0:
             mean_iou = iou_sum[i] / total_counts[i]
             s = f"L{i}:{success_counts[i]}s/{total_counts[i]-success_counts[i]}f"
-            s += f"(iou={mean_iou:.2f}"
             if success_counts[i] > 0:
-                s += f",+{overshoot_sum[i]/success_counts[i]:.1f}"
-            s += ")"
+                s += f"(overshoot={overshoot_sum[i]/success_counts[i]:.1f})"
             stats.append(s)
     print(f"  Episodes: {num_success}/{selfplay_batch_size} ({success_rate:.1%}) | {' | '.join(stats)}")
+
+    # Update IoU baseline (EMA of mean raw IoU, excluding perfect episodes)
+    non_perfect_mask = ~np.array(episode_success)
+    if np.any(non_perfect_mask):
+        mean_non_perfect_iou = float(np.mean(np.array(max_rewards)[non_perfect_mask]))
+        if iou_baseline is None:
+            iou_warmup_samples.append(mean_non_perfect_iou)
+        else:
+            iou_baseline = iou_baseline_ema_rate * iou_baseline + (1 - iou_baseline_ema_rate) * mean_non_perfect_iou
+    mean_all_iou = float(jnp.mean(max_rewards))
+    baseline_str = f"{iou_baseline:.4f}" if iou_baseline is not None else "warmup"
+    print(f"  IoU: all={mean_all_iou:.4f}, non-perfect={mean_non_perfect_iou:.4f}, baseline={baseline_str}")
 
     # Check value prediction accuracy
     # encoder_outputs: (batch, num_points, n_embd) — from selfplay_episode, computed once
@@ -678,6 +692,11 @@ for iteration in range(max_num_iters):
         print(f"  Skipping training (pool not full yet) | Time: {iter_time:.2f}s (selfplay={selfplay_time:.2f}s)\n")
         continue
 
+    # Initialize baseline from warmup samples (first time pool is full)
+    if iou_baseline is None and iou_warmup_samples:
+        iou_baseline = float(np.mean(iou_warmup_samples))
+        print(f"  IoU baseline initialized: {iou_baseline:.4f} (from {len(iou_warmup_samples)} warmup iters)")
+
     # Update curriculum based on pool statistics (using target formula lengths)
     pool_expr_lengths = np.array([len(expr) for expr in pool.target_polish_exprs])
     pool_total_counts = np.zeros(len(length_distribution), dtype=int)
@@ -699,7 +718,7 @@ for iteration in range(max_num_iters):
     for step in range(training_steps_per_iter):
         rng_key, subkey = jax.random.split(rng_key)
         (loss, (policy_loss, value_loss)), grads = grad_fn(
-            model, *pool.sample_batch(training_batch_size, subkey, training_length_distribution, min_success_ratio_per_length)
+            model, *pool.sample_batch(training_batch_size, subkey, training_length_distribution, min_success_ratio_per_length, iou_baseline or 0.0)
         )
         optimizer.update(model, grads)
         policy_losses.append(policy_loss)
@@ -714,7 +733,7 @@ for iteration in range(max_num_iters):
     iter_time = time.time() - iter_start
 
     print(f"  Loss: {avg_loss:.4f} (policy={avg_policy_loss:.4f}, value={avg_value_loss:.4f}) "
-          f"[last batch: {pool._last_sample_success_count}/{training_batch_size} success]")
+          f"[last batch: {pool._last_sample_above_avg_count}/{training_batch_size} above-avg, baseline={iou_baseline:.4f}]")
     print(f"  Time: {iter_time:.2f}s (selfplay={selfplay_time:.2f}s, train={train_time:.2f}s)\n")
 
     # Checkpoint
